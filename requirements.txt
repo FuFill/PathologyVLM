@@ -1,15 +1,15 @@
-# --- PyTorch (CUDA 12.1 wheels; backward-compatible with the CUDA 12.9 host) ---
---extra-index-url https://download.pytorch.org/whl/cu121
-torch==2.1.2
-torchvision==0.16.2
+# --- PyTorch (cu129 wheels; the ClearML agent forces its cu129 index for
+#     agent.cuda_version=129, so we pin to a version actually present there) ---
+torch==2.8.0
+torchvision==0.23.0
 
-# --- ClearML orchestration ---
+# --- ClearML SDK (matches the agent v3.0.x line) ---
 clearml==1.16.4
 
 # --- LLaVA / Quilt-LLaVA inference stack ---
-# wisdomik/Quilt-Llava-v1.5-7b is a LLaVA-1.5 fork. transformers 4.37.2 is
-# the last release where LlavaForConditionalGeneration loads this checkpoint
-# without the newer chat-template requirements.
+# wisdomik/Quilt-Llava-v1.5-7b is a LLaVA-1.5 checkpoint. transformers 4.37.2
+# loads it via LlavaForConditionalGeneration without requiring the newer chat
+# templates introduced in 4.40+.
 transformers==4.37.2
 tokenizers==0.15.2
 accelerate==0.27.2
