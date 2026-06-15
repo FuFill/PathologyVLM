@@ -1,0 +1,29 @@
+project_name: Pathology/VLM
+task_name: pathgen_llava_test_10
+queue_name: gpu
+
+dataset_project: Pathology/VLM
+dataset_name: pathgen_he_test_10
+
+model_name: wisdomik/Quilt-Llava-v1.5-7b
+
+output_dir: outputs
+max_images: 10
+max_new_tokens: 512
+temperature: 0.0
+load_4bit: true
+
+# PathGen-1.6M (jamessyx/PathGen) data preparation defaults.
+# These are consumed by scripts/prepare_pathgen_subset.py.
+pathgen:
+  # Full path to the PathGen-1.6M JSON downloaded from
+  # https://huggingface.co/datasets/jamessyx/PathGen (gated; accept terms first).
+  pathgen_json: PathGen-1.6M.json
+  # Directory that contains downloaded TCGA .svs files. The script accepts both
+  # flat layouts ("<wsi_dir>/<wsi_id>.svs") and the gdc-client layout
+  # ("<wsi_dir>/<file_id>/<wsi_id>.svs").
+  wsi_dir: data/wsi
+  # Patch size in WSI level-0 pixels (PathGen default).
+  patch_size: 672
+  # If true, run `gdc-client download <file_id>` when the .svs is missing.
+  auto_download: true

@@ -1,0 +1,14 @@
+clearml
+datasets
+huggingface_hub
+transformers
+accelerate
+bitsandbytes
+torch
+torchvision
+pillow
+pandas
+tqdm
+pyyaml
+# WSI patch extraction for PathGen-1.6M (requires native OpenSlide library, see README)
+openslide-python

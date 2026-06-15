@@ -218,3 +218,46 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ===== vlm-pathology-baseline =====
+
+# credentials
+clearml.conf
+*.conf
+.env
+.env.*
+
+# data and outputs
+data/he_test_10/
+data/wsi/
+outputs/
+*.jsonl
+*.csv
+
+# PathGen metadata (gated, ~1 GB) and TCGA whole-slide images
+PathGen-1.6M.json
+*.svs
+*.ndpi
+*.tiff
+*.tif
+
+# caches
+__pycache__/
+*.pyc
+.cache/
+.huggingface/
+wandb/
+.clearml/
+
+# models
+models/
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# keep placeholders
+!data/.gitkeep
+!outputs/.gitkeep
+
