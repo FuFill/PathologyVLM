@@ -75,11 +75,11 @@ OUTPUT_FIELDS = [
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run remote VLM inference via ClearML.")
     parser.add_argument("--project_name", default="Pathology/VLM", help="ClearML project name.")
-    parser.add_argument("--task_name", default="quilt_llava_test_10", help="ClearML task name.")
-    parser.add_argument("--queue_name", default="gpu", help="ClearML queue for remote execution.")
+    parser.add_argument("--task_name", default="pathgen_llava_test_10", help="ClearML task name.")
+    parser.add_argument("--queue_name", default="default", help="ClearML queue for remote execution.")
 
     parser.add_argument("--dataset_project", default="Pathology/VLM", help="ClearML dataset project.")
-    parser.add_argument("--dataset_name", default="quilt_he_test_10", help="ClearML dataset name.")
+    parser.add_argument("--dataset_name", default="pathgen_he_test_10", help="ClearML dataset name.")
 
     parser.add_argument(
         "--model_name",
@@ -125,9 +125,31 @@ def main() -> int:
         project_name=args.project_name,
         task_name=args.task_name,
         reuse_last_task_id=False,
+        # Disable the agent's default S3 output_uri inheritance. The remote
+        # clearml.conf on this server points sdk.development.default_output_uri
+        # at an s3:// bucket whose driver (boto3) is not installed, which
+        # makes Task.init() raise "Could not get access credentials". We do
+        # not need remote artifact storage for this run -- artifacts will be
+        # served by the ClearML files server.
+        output_uri=False,
     )
     task.connect(vars(args))
     logger = task.get_logger()
+
+    # Pin the remote Python environment to our repo's requirements.txt
+    # instead of letting ClearML auto-freeze the local (Windows) venv,
+    # which would otherwise produce an incompatible stack on the agent
+    # (e.g. transformers==5.x, torch==2.12, pillow==12.2 which do not work
+    # with wisdomik/Quilt-Llava-v1.5-7b).
+    try:
+        req_path = PROJECT_ROOT / "requirements.txt"
+        if req_path.is_file():
+            task.set_packages(str(req_path))
+            print(f"[run_remote_vlm] Pinned remote packages from: {req_path}")
+        else:
+            print(f"[run_remote_vlm] WARNING: requirements.txt not found at {req_path}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[run_remote_vlm] WARNING: could not set packages: {exc}")
 
     # ------------------------------------------------------------------
     # 2. If requested, switch to remote execution and exit locally.
