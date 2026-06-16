@@ -129,6 +129,49 @@ def _free_transformers_llava_slot() -> None:
     )
 
 
+def _stub_llava_mpt() -> None:
+    """Pre-insert a fake ``llava.model.language_model.llava_mpt`` module
+    so the real one (which imports ``_expand_mask`` from
+    ``transformers.models.bloom.modeling_bloom`` -- removed in transformers
+    >= 4.36) is never executed.
+
+    Our checkpoint ``wisdomik/Quilt-Llava-v1.5-7b`` is Llama-based; the
+    MPT branch of the upstream package is dead code for our path.
+    Builder selects Llama vs MPT via ``'mpt' in model_name.lower()``,
+    so as long as the model name does not contain 'mpt', the stubbed
+    ``LlavaMPTForCausalLM`` is never instantiated.
+
+    IMPORTANT: We must ONLY pre-stub the leaf ``llava_mpt`` module. If we
+    also pre-stub ``llava`` / ``llava.model`` / etc. with empty placeholder
+    modules, Python's import system will happily return them instead of
+    executing the real ``__init__.py`` files on disk, leaving the real
+    package un-initialised (no ``LlavaLlamaForCausalLM``, no builder...).
+    """
+    import sys
+    import types
+
+    mpt_stub = types.ModuleType("llava.model.language_model.llava_mpt")
+
+    class _LlavaMPTConfig:  # noqa: D401, WPS431
+        """Stub - real MPT path disabled (transformers>=4.36 incompatibility)."""
+
+        model_type = "llava_mpt_stub"
+
+    class _LlavaMPTForCausalLM:  # noqa: D401, WPS431
+        """Stub - real MPT path disabled (transformers>=4.36 incompatibility)."""
+
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(
+                "LlavaMPTForCausalLM is stubbed out in this environment "
+                "(MPT path requires transformers<4.36)."
+            )
+
+    mpt_stub.LlavaMPTForCausalLM = _LlavaMPTForCausalLM
+    mpt_stub.LlavaMPTConfig = _LlavaMPTConfig
+    sys.modules["llava.model.language_model.llava_mpt"] = mpt_stub
+    print("[run_remote_vlm] Stubbed llava.model.language_model.llava_mpt")
+
+
 def _bootstrap_llava() -> None:
     """Ensure the upstream ``llava`` package is importable.
 
@@ -136,37 +179,51 @@ def _bootstrap_llava() -> None:
     which would clobber our requirements.txt stack. We therefore install
     it with ``--no-deps`` only if it is not already present.
 
-    We also unregister HF transformers' built-in ``llava`` config before
-    importing, otherwise Quilt-LLaVA's ``AutoConfig.register("llava", ...)``
-    blows up at import time.
+    Before importing we also:
+      * free the transformers ``llava`` config slot (otherwise
+        ``AutoConfig.register('llava', ...)`` blows up);
+      * stub the MPT submodule (otherwise it tries to import
+        ``_expand_mask`` from transformers.models.bloom, which was
+        removed in transformers>=4.36).
     """
-    # Always free the slot first; cheap and idempotent.
-    _free_transformers_llava_slot()
-
+    # Install first (if missing). We do this BEFORE pre-stubbing so that
+    # the parent ``llava`` package on disk has the chance to register
+    # itself normally; the stubs in sys.modules only intercept the
+    # specific incompatible submodule.
     try:
-        import llava  # noqa: F401
-        print(f"[run_remote_vlm] llava already importable from: {llava.__file__}")
-        return
+        import importlib
+        importlib.import_module("llava")  # probe only
+        already = True
     except ImportError:
-        pass
+        already = False
 
-    import subprocess
-    print(f"[run_remote_vlm] Installing llava (--no-deps) from {QUILT_LLAVA_GIT}")
-    cmd = [
-        sys.executable, "-m", "pip", "install", "--no-deps", "--no-cache-dir",
-        QUILT_LLAVA_GIT,
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    print(res.stdout)
-    if res.returncode != 0:
-        print(res.stderr, file=sys.stderr)
-        raise RuntimeError(f"pip install of llava failed (exit {res.returncode})")
+    if not already:
+        import subprocess
+        print(f"[run_remote_vlm] Installing llava (--no-deps) from {QUILT_LLAVA_GIT}")
+        cmd = [
+            sys.executable, "-m", "pip", "install", "--no-deps", "--no-cache-dir",
+            QUILT_LLAVA_GIT,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        print(res.stdout)
+        if res.returncode != 0:
+            print(res.stderr, file=sys.stderr)
+            raise RuntimeError(f"pip install of llava failed (exit {res.returncode})")
 
-    # Verify import works (slot is still freed from above).
+    # Make sure any half-imported ``llava`` modules from a prior failed
+    # import attempt are evicted; then apply patches and import fresh.
+    import sys as _sys
+    for key in list(_sys.modules):
+        if key == "llava" or key.startswith("llava."):
+            del _sys.modules[key]
+
+    _free_transformers_llava_slot()
+    _stub_llava_mpt()
+
     import importlib
     importlib.invalidate_caches()
     import llava  # noqa: F401
-    print(f"[run_remote_vlm] llava installed and importable from: {llava.__file__}")
+    print(f"[run_remote_vlm] llava importable from: {llava.__file__}")
 
 
 def _parse_args() -> argparse.Namespace:
