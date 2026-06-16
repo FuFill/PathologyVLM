@@ -31,21 +31,36 @@ if str(PROJECT_ROOT) not in sys.path:
 PROMPT = """You are a pathology image assistant. Analyze the provided H&E histology image.
 
 Important rules:
-1. Do not provide a final diagnosis.
-2. Describe only visible morphological features.
-3. If there is not enough visual evidence, set should_abstain to true.
-4. Return only valid JSON. Do not add explanations outside JSON.
+1. Do not provide a final clinical diagnosis.
+2. Describe only morphological features that are visible in this image.
+3. If there is not enough visual evidence to identify the organ, set
+   tissue_organ to "other" and set should_abstain to true.
+4. Return ONLY a single JSON object. No prose before or after. No markdown
+   fences. No backslash escapes inside field names (write "tissue_organ",
+   never "tissue\\_organ").
+5. First decide tissue_organ from the allowed list below, then write the
+   morphology fields consistent with that choice.
 
-Return JSON with exactly these fields:
+tissue_organ must be exactly ONE of:
+  "colon", "rectum", "lung", "breast", "kidney", "prostate", "brain",
+  "liver", "stomach", "pancreas", "lymph_node", "skin", "bone_marrow",
+  "soft_tissue", "other"
+
+tumor_suspicious must be exactly ONE of: "yes", "no", "uncertain".
+confidence must be exactly ONE of: "low", "medium", "high".
+should_abstain must be a JSON boolean (true or false).
+
+Return JSON with exactly these fields, in this order:
 {
-  "tissue_description": "",
-  "cellularity": "",
-  "architecture": "",
-  "visible_abnormalities": [],
+  "tissue_organ": "<one of the allowed values>",
+  "tissue_description": "<one short sentence on the visible tissue>",
+  "cellularity": "<low | moderate | high, plus one short justification>",
+  "architecture": "<preserved | mildly distorted | severely distorted, plus one short justification>",
+  "visible_abnormalities": ["<short phrase>", "..."],
   "tumor_suspicious": "yes/no/uncertain",
-  "evidence": [],
-  "artifacts": [],
-  "limitations": [],
+  "evidence": ["<short morphological feature supporting tumor_suspicious>", "..."],
+  "artifacts": ["<short phrase>", "..."],
+  "limitations": ["<short phrase>", "..."],
   "confidence": "low/medium/high",
   "should_abstain": true
 }"""
@@ -58,6 +73,7 @@ OUTPUT_FIELDS = [
     "model_name",
     "raw_response",
     "json_valid",
+    "tissue_organ",
     "tissue_description",
     "cellularity",
     "architecture",
@@ -229,7 +245,7 @@ def _bootstrap_llava() -> None:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run remote VLM inference via ClearML.")
     parser.add_argument("--project_name", default="Pathology/VLM", help="ClearML project name.")
-    parser.add_argument("--task_name", default="pathgen_llava_test_10", help="ClearML task name.")
+    parser.add_argument("--task_name", default="pathgen_llava_test_10_promptv2", help="ClearML task name.")
     parser.add_argument("--queue_name", default="default", help="ClearML queue for remote execution.")
 
     parser.add_argument("--dataset_project", default="Pathology/VLM", help="ClearML dataset project.")

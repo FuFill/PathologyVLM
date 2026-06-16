@@ -14,6 +14,7 @@ from typing import Any, Optional
 
 # Stable output schema. Keep in sync with the fixed prompt in run_remote_vlm.py.
 DEFAULT_SCHEMA: dict[str, Any] = {
+    "tissue_organ": "other",
     "tissue_description": "",
     "cellularity": "",
     "architecture": "",
@@ -28,6 +29,56 @@ DEFAULT_SCHEMA: dict[str, Any] = {
 
 _ALLOWED_TUMOR_SUSPICIOUS = {"yes", "no", "uncertain"}
 _ALLOWED_CONFIDENCE = {"low", "medium", "high"}
+# Closed organ vocabulary. Keep in sync with the prompt in run_remote_vlm.py.
+ALLOWED_TISSUE_ORGAN = {
+    "colon",
+    "rectum",
+    "lung",
+    "breast",
+    "kidney",
+    "prostate",
+    "brain",
+    "liver",
+    "stomach",
+    "pancreas",
+    "lymph_node",
+    "skin",
+    "bone_marrow",
+    "soft_tissue",
+    "other",
+}
+# Common free-text aliases the model is likely to emit, mapped to the canonical
+# vocabulary. Matching is case-insensitive on a normalized form.
+_TISSUE_ORGAN_ALIASES: dict[str, str] = {
+    "colorectal": "colon",
+    "colorectum": "colon",
+    "large_intestine": "colon",
+    "large intestine": "colon",
+    "intestine": "colon",
+    "intestines": "colon",
+    "small_intestine": "colon",
+    "small intestine": "colon",
+    "gastrointestinal": "stomach",
+    "gastrointestinal_tract": "stomach",
+    "gi_tract": "stomach",
+    "gi": "stomach",
+    "renal": "kidney",
+    "mammary": "breast",
+    "cerebral": "brain",
+    "cerebrum": "brain",
+    "cns": "brain",
+    "hepatic": "liver",
+    "lymphnode": "lymph_node",
+    "lymph node": "lymph_node",
+    "bonemarrow": "bone_marrow",
+    "bone marrow": "bone_marrow",
+    "softtissue": "soft_tissue",
+    "soft tissue": "soft_tissue",
+    "connective tissue": "soft_tissue",
+    "connective_tissue": "soft_tissue",
+    "tendon": "soft_tissue",
+    "tendon_sheath": "soft_tissue",
+}
 
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE | re.MULTILINE)
 
@@ -157,6 +208,45 @@ def _coerce_choice(value: Any, allowed: set[str], default: str) -> str:
     return default
 
 
+def _coerce_tissue_organ(value: Any) -> str:
+    """Map a free-text organ string to the canonical ALLOWED_TISSUE_ORGAN set.
+
+    Lower-cases, trims, replaces spaces/dashes with underscores, then:
+      1. accepts if already in ALLOWED_TISSUE_ORGAN
+      2. accepts via _TISSUE_ORGAN_ALIASES lookup
+      3. accepts if any allowed token appears as a substring (e.g.
+         "lung adenocarcinoma" -> "lung", "renal cell carcinoma" -> "kidney"
+         via the 'renal' alias)
+      4. otherwise returns "other"
+    """
+    if not isinstance(value, str):
+        return "other"
+    raw = value.strip().lower()
+    if not raw:
+        return "other"
+    norm = raw.replace("-", "_")
+    norm_spaced = norm.replace("_", " ")
+
+    if norm in ALLOWED_TISSUE_ORGAN:
+        return norm
+    if norm in _TISSUE_ORGAN_ALIASES:
+        return _TISSUE_ORGAN_ALIASES[norm]
+    if norm_spaced in _TISSUE_ORGAN_ALIASES:
+        return _TISSUE_ORGAN_ALIASES[norm_spaced]
+
+    # Substring fallback: scan canonical first, then aliases.
+    for token in ALLOWED_TISSUE_ORGAN:
+        if token == "other":
+            continue
+        token_spaced = token.replace("_", " ")
+        if token in norm or token_spaced in norm_spaced:
+            return token
+    for alias, canonical in _TISSUE_ORGAN_ALIASES.items():
+        if alias in norm or alias in norm_spaced:
+            return canonical
+    return "other"
+
+
 def normalize_json(parsed: Optional[dict]) -> dict:
     """Return a dict that always follows DEFAULT_SCHEMA.
 
@@ -174,6 +264,13 @@ def normalize_json(parsed: Optional[dict]) -> dict:
     for key in ("tissue_description", "cellularity", "architecture"):
         if key in parsed:
             out[key] = _coerce_str(parsed[key])
+
+    # Tissue organ (constrained vocabulary).
+    if "tissue_organ" in parsed:
+        out["tissue_organ"] = _coerce_tissue_organ(parsed["tissue_organ"])
+    elif "tissue_description" in parsed:
+        # Best-effort fallback: try to extract organ from a free-text description.
+        out["tissue_organ"] = _coerce_tissue_organ(parsed["tissue_description"])
 
     # List fields.
     for key in ("visible_abnormalities", "evidence", "artifacts", "limitations"):

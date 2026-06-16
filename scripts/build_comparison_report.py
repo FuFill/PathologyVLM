@@ -42,6 +42,19 @@ TSS_MAP: dict[str, tuple[str, str]] = {
     "HT": ("Case Western - St Joes", "Brain Lower Grade Glioma"),
 }
 
+# Map TCGA study string -> the canonical tissue_organ token expected from the
+# model. Used to score model tissue identification against cohort-level truth.
+STUDY_TO_ORGAN: dict[str, str] = {
+    "Lung squamous cell carcinoma": "lung",
+    "Lung adenocarcinoma": "lung",
+    "Colon adenocarcinoma": "colon",
+    "Rectum adenocarcinoma": "rectum",
+    "Kidney renal clear cell carcinoma": "kidney",
+    "Breast invasive carcinoma": "breast",
+    "Prostate adenocarcinoma": "prostate",
+    "Brain Lower Grade Glioma": "brain",
+}
+
 
 def load_jsonl(path: Path) -> list[dict]:
     rows: list[dict] = []
@@ -97,6 +110,21 @@ def render_txt(rows: list[dict]) -> str:
     out.append(f"N images:  {len(rows)}")
     n_valid = sum(1 for r in rows if r["model"]["json_valid"])
     out.append(f"Valid JSON: {n_valid}/{len(rows)}  ({n_valid / len(rows):.0%})")
+    n_with_organ_truth = sum(
+        1 for r in rows
+        if STUDY_TO_ORGAN.get(TSS_MAP.get(tss_of(r["manifest"]["wsi_id"]), ("", ""))[1])
+    )
+    n_organ_correct = sum(
+        1 for r in rows
+        if r["model"].get("tissue_organ")
+        and STUDY_TO_ORGAN.get(TSS_MAP.get(tss_of(r["manifest"]["wsi_id"]), ("", ""))[1])
+        == r["model"]["tissue_organ"]
+    )
+    if n_with_organ_truth:
+        out.append(
+            f"Tissue organ vs TCGA cohort: {n_organ_correct}/{n_with_organ_truth} "
+            f"({n_organ_correct / n_with_organ_truth:.0%})"
+        )
     out.append("=" * 96)
     out.append("")
     out.append(HEADER_NOTE)
@@ -108,12 +136,19 @@ def render_txt(rows: list[dict]) -> str:
         v = r["model"]
         tss = tss_of(m["wsi_id"])
         site, study = TSS_MAP.get(tss, ("(unknown TSS)", "(unknown study)"))
+        expected_organ = STUDY_TO_ORGAN.get(study, "")
+        model_organ = v.get("tissue_organ", "")
+        organ_match = (
+            "MATCH" if expected_organ and model_organ == expected_organ
+            else ("MISS" if expected_organ else "n/a")
+        )
 
         out.append(f"--- {r['image_id']} " + "-" * (96 - 5 - len(r["image_id"])))
         out.append(f"  file:        {m['image_path']}")
         out.append(f"  wsi_id:      {m['wsi_id']}")
         out.append(f"  tss_code:    {tss}    site: {site}")
         out.append(f"  TCGA study:  {study}   <- closest verified label (cohort-level)")
+        out.append(f"  expected organ (from cohort): {expected_organ or '(unknown)'}")
         out.append(f"  patch:       ({m['x']}, {m['y']})  size={m['patch_size']}  mag={m['magnification']}")
         out.append("")
         out.append("  [PathGen reference_answer]  (auto-generated, NOT verified diagnosis)")
@@ -121,6 +156,7 @@ def render_txt(rows: list[dict]) -> str:
         out.append("")
         out.append("  [Model output]")
         out.append(f"    json_valid:         {v['json_valid']}")
+        out.append(f"    tissue_organ:       {model_organ}   [{organ_match}]")
         out.append(f"    tissue_description: {v['tissue_description']}")
         out.append(f"    cellularity:        {v['cellularity']}")
         out.append(f"    architecture:       {v['architecture']}")
@@ -142,6 +178,17 @@ def render_txt(rows: list[dict]) -> str:
 
 def render_md(rows: list[dict]) -> str:
     n_valid = sum(1 for r in rows if r["model"]["json_valid"])
+    n_with_organ_truth = sum(
+        1 for r in rows
+        if STUDY_TO_ORGAN.get(TSS_MAP.get(tss_of(r["manifest"]["wsi_id"]), ("", ""))[1])
+    )
+    n_organ_correct = sum(
+        1 for r in rows
+        if r["model"].get("tissue_organ")
+        and STUDY_TO_ORGAN.get(TSS_MAP.get(tss_of(r["manifest"]["wsi_id"]), ("", ""))[1])
+        == r["model"]["tissue_organ"]
+    )
+
     lines: list[str] = []
     lines.append("# VLM baseline comparison report\n")
     lines.append("| field | value |")
@@ -149,7 +196,13 @@ def render_md(rows: list[dict]) -> str:
     lines.append("| Model | `wisdomik/Quilt-Llava-v1.5-7b` (4-bit) |")
     lines.append("| Dataset | PathGen subset (10 H&E patches, 672x672 @ level0) |")
     lines.append(f"| N images | {len(rows)} |")
-    lines.append(f"| Valid JSON | {n_valid}/{len(rows)} ({n_valid / len(rows):.0%}) |\n")
+    lines.append(f"| Valid JSON | {n_valid}/{len(rows)} ({n_valid / len(rows):.0%}) |")
+    if n_with_organ_truth:
+        lines.append(
+            f"| Tissue organ vs TCGA cohort | {n_organ_correct}/{n_with_organ_truth} "
+            f"({n_organ_correct / n_with_organ_truth:.0%}) |"
+        )
+    lines.append("")
 
     lines.append("> **Note on \"ground truth\":** PathGen `reference_answer` is an "
                  "auto-generated description, *not* a verified clinical diagnosis. Use it "
@@ -159,17 +212,21 @@ def render_md(rows: list[dict]) -> str:
 
     # Summary table
     lines.append("## Summary\n")
-    lines.append("| image | TCGA study (cohort) | model: tissue | tumor | conf | abstain |")
-    lines.append("|---|---|---|---|---|---|")
+    lines.append("| image | TCGA study (cohort) | expected organ | model organ | match | tumor | conf | abstain |")
+    lines.append("|---|---|---|---|---|---|---|---|")
     for r in rows:
         m = r["manifest"]
         v = r["model"]
         study = TSS_MAP.get(tss_of(m["wsi_id"]), ("", ""))[1]
-        tissue = (v["tissue_description"] or "").replace("|", "\\|")
-        if len(tissue) > 70:
-            tissue = tissue[:67] + "..."
+        expected_organ = STUDY_TO_ORGAN.get(study, "")
+        model_organ = v.get("tissue_organ", "")
+        match = (
+            "OK" if expected_organ and model_organ == expected_organ
+            else ("MISS" if expected_organ else "-")
+        )
         lines.append(
-            f"| `{r['image_id']}` | {study} | {tissue} | "
+            f"| `{r['image_id']}` | {study} | {expected_organ or '-'} | "
+            f"{model_organ or '-'} | **{match}** | "
             f"{v['tumor_suspicious']} | {v['confidence']} | {v['should_abstain']} |"
         )
     lines.append("")
@@ -181,12 +238,19 @@ def render_md(rows: list[dict]) -> str:
         v = r["model"]
         tss = tss_of(m["wsi_id"])
         site, study = TSS_MAP.get(tss, ("(unknown TSS)", "(unknown study)"))
+        expected_organ = STUDY_TO_ORGAN.get(study, "")
+        model_organ = v.get("tissue_organ", "")
+        organ_match = (
+            "MATCH" if expected_organ and model_organ == expected_organ
+            else ("MISS" if expected_organ else "n/a")
+        )
 
         lines.append(f"### `{r['image_id']}`\n")
         lines.append(f"- **file:** `{m['image_path']}`")
         lines.append(f"- **wsi_id:** `{m['wsi_id']}`")
         lines.append(f"- **TSS:** `{tss}` -- {site}")
         lines.append(f"- **TCGA study (cohort label):** **{study}**")
+        lines.append(f"- **expected organ (from cohort):** `{expected_organ or '(unknown)'}`")
         lines.append(f"- **patch:** `({m['x']}, {m['y']})` size={m['patch_size']} "
                      f"mag={m['magnification']}\n")
 
@@ -195,6 +259,7 @@ def render_md(rows: list[dict]) -> str:
 
         lines.append("**Model output:**\n")
         lines.append(f"- `json_valid`: `{v['json_valid']}`")
+        lines.append(f"- `tissue_organ`: **{model_organ or '-'}** ({organ_match})")
         lines.append(f"- `tissue_description`: {v['tissue_description']}")
         lines.append(f"- `cellularity`: {v['cellularity']}")
         lines.append(f"- `architecture`: {v['architecture']}")
