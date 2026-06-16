@@ -72,6 +72,47 @@ OUTPUT_FIELDS = [
 ]
 
 
+# Pinned Quilt-LLaVA git ref. We install at runtime with --no-deps to avoid
+# its setup.py downgrading torch/transformers from our requirements.txt.
+QUILT_LLAVA_GIT = (
+    "git+https://github.com/aldraus/quilt-llava"
+    "@7e70fc39f792ac55de010eb37bff0a6d6f491c13"
+)
+
+
+def _bootstrap_llava() -> None:
+    """Ensure the upstream ``llava`` package is importable.
+
+    Quilt-LLaVA's setup.py pins ``torch==2.0.1`` and ``transformers==4.31``,
+    which would clobber our requirements.txt stack. We therefore install
+    it with ``--no-deps`` only if it is not already present.
+    """
+    try:
+        import llava  # noqa: F401
+        print(f"[run_remote_vlm] llava already importable from: {llava.__file__}")
+        return
+    except ImportError:
+        pass
+
+    import subprocess
+    print(f"[run_remote_vlm] Installing llava (--no-deps) from {QUILT_LLAVA_GIT}")
+    cmd = [
+        sys.executable, "-m", "pip", "install", "--no-deps", "--no-cache-dir",
+        QUILT_LLAVA_GIT,
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    print(res.stdout)
+    if res.returncode != 0:
+        print(res.stderr, file=sys.stderr)
+        raise RuntimeError(f"pip install of llava failed (exit {res.returncode})")
+
+    # Verify import works.
+    import importlib
+    importlib.invalidate_caches()
+    import llava  # noqa: F401
+    print(f"[run_remote_vlm] llava installed and importable from: {llava.__file__}")
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run remote VLM inference via ClearML.")
     parser.add_argument("--project_name", default="Pathology/VLM", help="ClearML project name.")
@@ -162,7 +203,19 @@ def main() -> int:
     # ------------------------------------------------------------------
     # 3. Heavy imports (only done where the code actually runs - locally
     #    or on the remote agent).
+    #
+    # Before importing src.vlm_inference (which imports `llava`), make
+    # sure the upstream Quilt-LLaVA package is installed. We install with
+    # --no-deps so its pinned torch==2.0.1 / transformers==4.31 do NOT
+    # downgrade the rest of our stack from requirements.txt.
     # ------------------------------------------------------------------
+    try:
+        _bootstrap_llava()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[run_remote_vlm] ERROR bootstrapping llava: {exc}", file=sys.stderr)
+        traceback.print_exc()
+        return 2
+
     try:
         import torch  # noqa: WPS433 (local import on purpose)
 
@@ -212,7 +265,10 @@ def main() -> int:
     # 5. Load model.
     # ------------------------------------------------------------------
     try:
-        processor, model = load_model(args.model_name, load_4bit=bool(args.load_4bit))
+        tokenizer, model, image_processor, context_len = load_model(
+            args.model_name, load_4bit=bool(args.load_4bit)
+        )
+        print(f"[run_remote_vlm] context_len={context_len}")
     except Exception as exc:  # noqa: BLE001
         print(f"[run_remote_vlm] ERROR loading model {args.model_name!r}: {exc}", file=sys.stderr)
         traceback.print_exc()
@@ -262,8 +318,9 @@ def main() -> int:
             try:
                 raw = generate_answer(
                     image_path=img_path,
-                    processor=processor,
+                    tokenizer=tokenizer,
                     model=model,
+                    image_processor=image_processor,
                     prompt=PROMPT,
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
