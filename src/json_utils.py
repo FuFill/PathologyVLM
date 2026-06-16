@@ -31,10 +31,45 @@ _ALLOWED_CONFIDENCE = {"low", "medium", "high"}
 
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE | re.MULTILINE)
 
+# Markdown-style escapes Quilt-LLaVA / LLaVA frequently emits inside JSON keys
+# and values (e.g. "tissue\_description"). These are invalid per JSON spec.
+# Replace each illegal "\<char>" with just "<char>".
+_INVALID_BACKSLASH_RE = re.compile(r'\\([_*~`#+\-.!])')
+
 
 def _strip_markdown_fences(text: str) -> str:
     """Remove ```json ... ``` style fences from a string."""
     return _FENCE_RE.sub("", text).strip()
+
+
+def _repair_json_text(text: str) -> str:
+    """Repair common LLM JSON quirks that break ``json.loads``.
+
+    Currently:
+      * Strip illegal markdown-style backslash escapes like ``\\_`` -> ``_``.
+        JSON only permits ``\\"  \\\\  \\/  \\b  \\f  \\n  \\r  \\t  \\uXXXX``.
+    """
+    return _INVALID_BACKSLASH_RE.sub(r"\1", text)
+
+
+def _try_loads(candidate: str) -> Optional[dict]:
+    """Try json.loads, then try again after repairing common LLM quirks."""
+    try:
+        parsed = json.loads(candidate)
+        if isinstance(parsed, dict):
+            return parsed
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Second chance: repair markdown-style escapes and retry.
+    repaired = _repair_json_text(candidate)
+    if repaired != candidate:
+        try:
+            parsed = json.loads(repaired)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return None
 
 
 def extract_json(text: str) -> Optional[dict]:
@@ -42,9 +77,9 @@ def extract_json(text: str) -> Optional[dict]:
 
     Strategy:
       1. Strip markdown fences (```json ... ```).
-      2. Try direct ``json.loads``.
+      2. Try direct ``json.loads``; on failure repair markdown escapes and retry.
       3. Fall back to taking the substring between the first ``{`` and the
-         last ``}`` and parsing that.
+         last ``}`` and parsing that (with the same repair retry).
       4. Return ``None`` if everything fails.
     """
     if not text or not isinstance(text, str):
@@ -52,25 +87,19 @@ def extract_json(text: str) -> Optional[dict]:
 
     cleaned = _strip_markdown_fences(text)
 
-    # 1. Direct parse.
-    try:
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, dict):
-            return parsed
-    except (json.JSONDecodeError, ValueError):
-        pass
+    # 1. Direct parse (+ repair retry).
+    parsed = _try_loads(cleaned)
+    if parsed is not None:
+        return parsed
 
     # 2. Substring between first '{' and last '}'.
     first = cleaned.find("{")
     last = cleaned.rfind("}")
     if first != -1 and last != -1 and last > first:
         candidate = cleaned[first : last + 1]
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed
-        except (json.JSONDecodeError, ValueError):
-            return None
+        parsed = _try_loads(candidate)
+        if parsed is not None:
+            return parsed
 
     return None
 
