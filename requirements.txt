@@ -1,35 +1,22 @@
-# --- PyTorch (cu129 wheels; the ClearML agent forces its cu129 index for
-#     agent.cuda_version=129, so we pin to a version actually present there) ---
+--extra-index-url https://download.pytorch.org/whl/cu129
 torch==2.8.0
 torchvision==0.23.0
-
-# --- ClearML SDK (matches the agent v3.0.x line) ---
 clearml==1.16.4
-
-# --- LLaVA / Quilt-LLaVA inference stack ---
-# wisdomik/Quilt-Llava-v1.5-7b is a LLaVA-1.5 checkpoint. transformers 4.37.2
-# loads it via LlavaForConditionalGeneration without requiring the newer chat
-# templates introduced in 4.40+.
 transformers==4.37.2
 tokenizers==0.15.2
 accelerate==0.27.2
 safetensors==0.4.2
 sentencepiece==0.2.0
 protobuf==4.25.3
-
-# 4-bit quantization (only used when --load_4bit is passed; harmless otherwise)
 bitsandbytes==0.43.1
-
-# --- Hugging Face data / hub ---
 huggingface_hub==0.20.3
 datasets==2.16.1
-
-# --- Imaging / utilities ---
 pillow==10.3.0
 numpy==1.26.4
 pandas==2.2.2
 tqdm==4.66.4
 pyyaml==6.0.1
-
-# --- WSI patch extraction for PathGen-1.6M (requires native OpenSlide library) ---
 openslide-python==1.3.1
+einops==0.7.0
+shortuuid==1.0.11
+git+https://github.com/aldraus/quilt-llava.git@main#egg=llava
