@@ -80,13 +80,69 @@ QUILT_LLAVA_GIT = (
 )
 
 
+def _free_transformers_llava_slot() -> None:
+    """Unregister HF transformers' built-in ``llava`` config so the upstream
+    Quilt-LLaVA package can claim the same ``model_type`` key.
+
+    Background
+    ----------
+    HF transformers >= 4.36 ships a ``LlavaForConditionalGeneration`` whose
+    ``model_type`` is ``"llava"``. The upstream Quilt-LLaVA / LLaVA-1.5
+    package contains, at import time:
+
+        AutoConfig.register("llava", LlavaConfig)
+
+    Without intervention, importing ``llava`` raises:
+
+        ValueError: 'llava' is already used by a Transformers config,
+                    pick another name.
+
+    We remove the entry from both ``CONFIG_MAPPING_NAMES`` (lazy lookup
+    table) and ``CONFIG_MAPPING._extra_content`` (set by previous
+    registrations) BEFORE importing ``llava``. The upstream
+    ``AutoConfig.register("llava", ...)`` then succeeds and points the
+    ``"llava"`` model_type at ``LlavaLlamaForCausalLM`` (Llama-derived,
+    matches the wisdomik/Quilt-Llava-v1.5-7b checkpoint).
+
+    The official ``LlavaForConditionalGeneration`` is incompatible with
+    that checkpoint anyway (different state-dict key naming), so we lose
+    nothing by reclaiming the slot.
+    """
+    try:
+        from transformers.models.auto.configuration_auto import (
+            CONFIG_MAPPING,
+            CONFIG_MAPPING_NAMES,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[run_remote_vlm] WARNING: could not access transformers auto "
+            f"mappings to free 'llava' slot: {exc}"
+        )
+        return
+
+    removed_names = CONFIG_MAPPING_NAMES.pop("llava", None)
+    extra = getattr(CONFIG_MAPPING, "_extra_content", {})
+    removed_extra = extra.pop("llava", None) if isinstance(extra, dict) else None
+    print(
+        f"[run_remote_vlm] Freed transformers 'llava' slot "
+        f"(names_entry={removed_names!r}, extra_entry={type(removed_extra).__name__ if removed_extra else None})"
+    )
+
+
 def _bootstrap_llava() -> None:
     """Ensure the upstream ``llava`` package is importable.
 
     Quilt-LLaVA's setup.py pins ``torch==2.0.1`` and ``transformers==4.31``,
     which would clobber our requirements.txt stack. We therefore install
     it with ``--no-deps`` only if it is not already present.
+
+    We also unregister HF transformers' built-in ``llava`` config before
+    importing, otherwise Quilt-LLaVA's ``AutoConfig.register("llava", ...)``
+    blows up at import time.
     """
+    # Always free the slot first; cheap and idempotent.
+    _free_transformers_llava_slot()
+
     try:
         import llava  # noqa: F401
         print(f"[run_remote_vlm] llava already importable from: {llava.__file__}")
@@ -106,7 +162,7 @@ def _bootstrap_llava() -> None:
         print(res.stderr, file=sys.stderr)
         raise RuntimeError(f"pip install of llava failed (exit {res.returncode})")
 
-    # Verify import works.
+    # Verify import works (slot is still freed from above).
     import importlib
     importlib.invalidate_caches()
     import llava  # noqa: F401
