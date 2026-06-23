@@ -230,6 +230,7 @@ clearml.conf
 # data and outputs
 data/he_test_10/
 data/wsi/
+data/quilt-1m
 outputs/
 *.jsonl
 *.csv
@@ -260,4 +261,3 @@ checkpoints/
 # keep placeholders
 !data/.gitkeep
 !outputs/.gitkeep
-
