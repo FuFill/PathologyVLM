@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 # Stable output schema. Keep in sync with the fixed prompt in run_remote_vlm.py.
 DEFAULT_SCHEMA: dict[str, Any] = {
-    "tissue_organ": "other",
+    "tissue_organ": "uncertain",
     "tissue_description": "",
     "cellularity": "",
     "architecture": "",
@@ -23,7 +23,8 @@ DEFAULT_SCHEMA: dict[str, Any] = {
     "evidence": [],
     "artifacts": [],
     "limitations": [],
-    "confidence": "low",
+    "visual_description_confidence": "low",
+    "conclusion_confidence": "low",
     "should_abstain": True,
 }
 
@@ -46,6 +47,7 @@ ALLOWED_TISSUE_ORGAN = {
     "bone_marrow",
     "soft_tissue",
     "other",
+    "uncertain",
 }
 # Common free-text aliases the model is likely to emit, mapped to the canonical
 # vocabulary. Matching is case-insensitive on a normalized form.
@@ -217,13 +219,13 @@ def _coerce_tissue_organ(value: Any) -> str:
       3. accepts if any allowed token appears as a substring (e.g.
          "lung adenocarcinoma" -> "lung", "renal cell carcinoma" -> "kidney"
          via the 'renal' alias)
-      4. otherwise returns "other"
+      4. otherwise returns "uncertain"
     """
     if not isinstance(value, str):
-        return "other"
+        return "uncertain"
     raw = value.strip().lower()
     if not raw:
-        return "other"
+        return "uncertain"
     norm = raw.replace("-", "_")
     norm_spaced = norm.replace("_", " ")
 
@@ -244,14 +246,14 @@ def _coerce_tissue_organ(value: Any) -> str:
     for alias, canonical in _TISSUE_ORGAN_ALIASES.items():
         if alias in norm or alias in norm_spaced:
             return canonical
-    return "other"
+    return "uncertain"
 
 
 def normalize_json(parsed: Optional[dict]) -> dict:
     """Return a dict that always follows DEFAULT_SCHEMA.
 
     Missing fields are filled with defaults. Lists are coerced into Python
-    lists when possible. ``tumor_suspicious`` and ``confidence`` are
+    lists when possible. ``tumor_suspicious`` and the confidence fields are
     constrained to their allowed enumerations. ``should_abstain`` is forced
     to a boolean.
     """
@@ -282,8 +284,18 @@ def normalize_json(parsed: Optional[dict]) -> dict:
         out["tumor_suspicious"] = _coerce_choice(
             parsed["tumor_suspicious"], _ALLOWED_TUMOR_SUSPICIOUS, "uncertain"
         )
+    if "visual_description_confidence" in parsed:
+        out["visual_description_confidence"] = _coerce_choice(
+            parsed["visual_description_confidence"], _ALLOWED_CONFIDENCE, "low"
+        )
+    if "conclusion_confidence" in parsed:
+        out["conclusion_confidence"] = _coerce_choice(
+            parsed["conclusion_confidence"], _ALLOWED_CONFIDENCE, "low"
+        )
     if "confidence" in parsed:
-        out["confidence"] = _coerce_choice(parsed["confidence"], _ALLOWED_CONFIDENCE, "low")
+        legacy = _coerce_choice(parsed["confidence"], _ALLOWED_CONFIDENCE, "low")
+        out["visual_description_confidence"] = legacy
+        out["conclusion_confidence"] = legacy
 
     # Boolean.
     if "should_abstain" in parsed:

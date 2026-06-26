@@ -1,9 +1,10 @@
-"""Run the QUILT-LLaVA baseline on a ClearML Dataset of H&E images.
+"""Run the QUILT-LLaVA baseline on local Quilt-1M images or a ClearML Dataset.
 
-Can run locally or be dispatched to a remote ClearML GPU agent via
-``--run_remote``. Results are saved as JSONL/CSV and uploaded to ClearML
-as artifacts, with input images logged as debug images and basic scalar
-metrics reported.
+Can run locally on a folder such as ``data/quilt-1m`` or be dispatched to
+a remote ClearML GPU agent via ``--run_remote`` when the inputs are stored
+in a ClearML Dataset. Results are saved as JSONL/CSV and uploaded to
+ClearML as artifacts, with input images logged as debug images and basic
+scalar metrics reported.
 
 The model must not provide a final diagnosis. The prompt below enforces
 this constraint and requires a structured JSON reply.
@@ -25,45 +26,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# ----------------------------------------------------------------------------
-# Fixed VLM prompt. Do not edit without versioning the task name.
-# ----------------------------------------------------------------------------
-PROMPT = """You are a pathology image assistant. Analyze the provided H&E histology image.
-
-Important rules:
-1. Do not provide a final clinical diagnosis.
-2. Describe only morphological features that are visible in this image.
-3. If there is not enough visual evidence to identify the organ, set
-   tissue_organ to "other" and set should_abstain to true.
-4. Return ONLY a single JSON object. No prose before or after. No markdown
-   fences. No backslash escapes inside field names (write "tissue_organ",
-   never "tissue\\_organ").
-5. First decide tissue_organ from the allowed list below, then write the
-   morphology fields consistent with that choice.
-
-tissue_organ must be exactly ONE of:
-  "colon", "rectum", "lung", "breast", "kidney", "prostate", "brain",
-  "liver", "stomach", "pancreas", "lymph_node", "skin", "bone_marrow",
-  "soft_tissue", "other"
-
-tumor_suspicious must be exactly ONE of: "yes", "no", "uncertain".
-confidence must be exactly ONE of: "low", "medium", "high".
-should_abstain must be a JSON boolean (true or false).
-
-Return JSON with exactly these fields, in this order:
-{
-  "tissue_organ": "<one of the allowed values>",
-  "tissue_description": "<one short sentence on the visible tissue>",
-  "cellularity": "<low | moderate | high, plus one short justification>",
-  "architecture": "<preserved | mildly distorted | severely distorted, plus one short justification>",
-  "visible_abnormalities": ["<short phrase>", "..."],
-  "tumor_suspicious": "yes/no/uncertain",
-  "evidence": ["<short morphological feature supporting tumor_suspicious>", "..."],
-  "artifacts": ["<short phrase>", "..."],
-  "limitations": ["<short phrase>", "..."],
-  "confidence": "low/medium/high",
-  "should_abstain": true
-}"""
+from src.prompt_templates import get_prompt
 
 
 # Columns in the output CSV / JSONL. Keep stable for downstream consumers.
@@ -82,7 +45,8 @@ OUTPUT_FIELDS = [
     "evidence",
     "artifacts",
     "limitations",
-    "confidence",
+    "visual_description_confidence",
+    "conclusion_confidence",
     "should_abstain",
     "error",
 ]
@@ -243,11 +207,22 @@ def _bootstrap_llava() -> None:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run remote VLM inference via ClearML.")
+    parser = argparse.ArgumentParser(description="Run Quilt-LLaVA inference locally or via ClearML.")
     parser.add_argument("--project_name", default="Pathology/VLM", help="ClearML project name.")
     parser.add_argument("--task_name", default="pathgen_llava_test_10_promptv2", help="ClearML task name.")
     parser.add_argument("--queue_name", default="default", help="ClearML queue for remote execution.")
 
+    parser.add_argument(
+        "--image_dir",
+        default="",
+        help="Local image directory. If set, images are read directly from this folder.",
+    )
+    parser.add_argument(
+        "--prompt_variant",
+        choices=tuple(sorted({"standard", "safe"})),
+        default="standard",
+        help="Which JSON prompt template to use.",
+    )
     parser.add_argument("--dataset_project", default="Pathology/VLM", help="ClearML dataset project.")
     parser.add_argument("--dataset_name", default="pathgen_he_test_10", help="ClearML dataset name.")
 
@@ -282,44 +257,67 @@ def _csv_safe(value: Any) -> Any:
 def main() -> int:
     args = _parse_args()
 
+    class _LocalLogger:
+        def report_image(self, *args, **kwargs):
+            return None
+
+        def report_scalar(self, *args, **kwargs):
+            return None
+
+        def report_single_value(self, *args, **kwargs):
+            return None
+
     # ------------------------------------------------------------------
     # 1. ClearML task init (must happen as early as possible).
     # ------------------------------------------------------------------
-    try:
-        from clearml import Dataset, Task
-    except ImportError as exc:
-        print(f"[run_remote_vlm] ERROR: clearml is not installed: {exc}", file=sys.stderr)
+    if args.run_remote and args.image_dir:
+        print(
+            "[run_remote_vlm] ERROR: --image_dir cannot be combined with --run_remote. "
+            "Upload the folder as a ClearML Dataset instead.",
+            file=sys.stderr,
+        )
         return 2
 
-    task = Task.init(
-        project_name=args.project_name,
-        task_name=args.task_name,
-        reuse_last_task_id=False,
-        # Disable the agent's default S3 output_uri inheritance. The remote
-        # clearml.conf on this server points sdk.development.default_output_uri
-        # at an s3:// bucket whose driver (boto3) is not installed, which
-        # makes Task.init() raise "Could not get access credentials". We do
-        # not need remote artifact storage for this run -- artifacts will be
-        # served by the ClearML files server.
-        output_uri=False,
-    )
-    task.connect(vars(args))
-    logger = task.get_logger()
+    task = None
+    if args.image_dir:
+        logger = _LocalLogger()
+        print("[run_remote_vlm] Running locally without ClearML task init.")
+    else:
+        try:
+            from clearml import Dataset, Task
+        except ImportError as exc:
+            print(f"[run_remote_vlm] ERROR: clearml is not installed: {exc}", file=sys.stderr)
+            return 2
 
-    # Pin the remote Python environment to our repo's requirements.txt
-    # instead of letting ClearML auto-freeze the local (Windows) venv,
-    # which would otherwise produce an incompatible stack on the agent
-    # (e.g. transformers==5.x, torch==2.12, pillow==12.2 which do not work
-    # with wisdomik/Quilt-Llava-v1.5-7b).
-    try:
-        req_path = PROJECT_ROOT / "requirements.txt"
-        if req_path.is_file():
-            task.set_packages(str(req_path))
-            print(f"[run_remote_vlm] Pinned remote packages from: {req_path}")
-        else:
-            print(f"[run_remote_vlm] WARNING: requirements.txt not found at {req_path}")
-    except Exception as exc:  # noqa: BLE001
-        print(f"[run_remote_vlm] WARNING: could not set packages: {exc}")
+        task = Task.init(
+            project_name=args.project_name,
+            task_name=args.task_name,
+            reuse_last_task_id=False,
+            # Disable the agent's default S3 output_uri inheritance. The remote
+            # clearml.conf on this server points sdk.development.default_output_uri
+            # at an s3:// bucket whose driver (boto3) is not installed, which
+            # makes Task.init() raise "Could not get access credentials". We do
+            # not need remote artifact storage for this run -- artifacts will be
+            # served by the ClearML files server.
+            output_uri=False,
+        )
+        task.connect(vars(args))
+        logger = task.get_logger()
+
+        # Pin the remote Python environment to our repo's requirements.txt
+        # instead of letting ClearML auto-freeze the local (Windows) venv,
+        # which would otherwise produce an incompatible stack on the agent
+        # (e.g. transformers==5.x, torch==2.12, pillow==12.2 which do not work
+        # with wisdomik/Quilt-Llava-v1.5-7b).
+        try:
+            req_path = PROJECT_ROOT / "requirements.txt"
+            if req_path.is_file():
+                task.set_packages(str(req_path))
+                print(f"[run_remote_vlm] Pinned remote packages from: {req_path}")
+            else:
+                print(f"[run_remote_vlm] WARNING: requirements.txt not found at {req_path}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[run_remote_vlm] WARNING: could not set packages: {exc}")
 
     # ------------------------------------------------------------------
     # 2. If requested, switch to remote execution and exit locally.
@@ -357,24 +355,28 @@ def main() -> int:
         return 2
 
     # ------------------------------------------------------------------
-    # 4. Resolve ClearML Dataset to a local path.
+    # 4. Resolve inputs to a local path.
     # ------------------------------------------------------------------
-    print(
-        f"[run_remote_vlm] Retrieving ClearML dataset: "
-        f"project={args.dataset_project!r} name={args.dataset_name!r}"
-    )
-    try:
-        dataset = Dataset.get(
-            dataset_project=args.dataset_project,
-            dataset_name=args.dataset_name,
+    if args.image_dir:
+        dataset_path = Path(args.image_dir)
+        print(f"[run_remote_vlm] Using local image directory: {dataset_path}")
+    else:
+        print(
+            f"[run_remote_vlm] Retrieving ClearML dataset: "
+            f"project={args.dataset_project!r} name={args.dataset_name!r}"
         )
-        dataset_path = dataset.get_local_copy()
-    except Exception as exc:  # noqa: BLE001
-        print(f"[run_remote_vlm] ERROR retrieving dataset: {exc}", file=sys.stderr)
-        traceback.print_exc()
-        return 1
+        try:
+            dataset = Dataset.get(
+                dataset_project=args.dataset_project,
+                dataset_name=args.dataset_name,
+            )
+            dataset_path = dataset.get_local_copy()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[run_remote_vlm] ERROR retrieving dataset: {exc}", file=sys.stderr)
+            traceback.print_exc()
+            return 1
 
-    print(f"[run_remote_vlm] Dataset local path: {dataset_path}")
+    print(f"[run_remote_vlm] Input local path: {dataset_path}")
 
     image_paths = find_images(dataset_path, max_images=args.max_images)
     print(f"[run_remote_vlm] Found {len(image_paths)} image(s).")
@@ -389,6 +391,7 @@ def main() -> int:
     if cuda_available:
         print(f"[run_remote_vlm] GPU: {gpu_name}")
     print(f"[run_remote_vlm] Model: {args.model_name}")
+    print(f"[run_remote_vlm] Prompt variant: {args.prompt_variant}")
 
     # ------------------------------------------------------------------
     # 5. Load model.
@@ -450,7 +453,7 @@ def main() -> int:
                     tokenizer=tokenizer,
                     model=model,
                     image_processor=image_processor,
-                    prompt=PROMPT,
+                    prompt=get_prompt(args.prompt_variant),
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
                 )
@@ -505,17 +508,18 @@ def main() -> int:
     # ------------------------------------------------------------------
     # 8. Final ClearML reporting + artifacts.
     # ------------------------------------------------------------------
-    try:
-        logger.report_single_value(name="num_images", value=n_total)
-        logger.report_single_value(name="valid_json_rate", value=valid_rate)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[run_remote_vlm] WARNING: could not report single values: {exc}")
+    if task is not None:
+        try:
+            logger.report_single_value(name="num_images", value=n_total)
+            logger.report_single_value(name="valid_json_rate", value=valid_rate)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[run_remote_vlm] WARNING: could not report single values: {exc}")
 
-    try:
-        task.upload_artifact(name="vlm_outputs_jsonl", artifact_object=str(jsonl_path))
-        task.upload_artifact(name="vlm_outputs_csv", artifact_object=str(csv_path))
-    except Exception as exc:  # noqa: BLE001
-        print(f"[run_remote_vlm] WARNING: artifact upload failed: {exc}")
+        try:
+            task.upload_artifact(name="vlm_outputs_jsonl", artifact_object=str(jsonl_path))
+            task.upload_artifact(name="vlm_outputs_csv", artifact_object=str(csv_path))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[run_remote_vlm] WARNING: artifact upload failed: {exc}")
 
     return 0
 

@@ -21,9 +21,10 @@ H&E patch / set of patches -> structured microdescription / explanation / uncert
 ## 1. Project overview
 
 * **Model (default):** `wisdomik/Quilt-Llava-v1.5-7b`
-* **Dataset (default):** `jamessyx/PathGen` (PathGen-1.6M)
+* **Dataset (default):** `data/quilt-1m` locally, or a ClearML Dataset copy of Quilt-1M
 * **Compute:** ClearML GPU agent (remote)
 * **Prompt:** fixed, requires JSON-only output
+* **Prompt variants:** `standard` (structured) and `safe` (abstain-first)
 * **Outputs:** `outputs/vlm_outputs.jsonl`, `outputs/vlm_outputs.csv`
 * **ClearML:** input images, scalar metrics, and output files are logged
   and uploaded as task artifacts.
@@ -261,8 +262,8 @@ the subset as a ClearML Dataset:
 ```bash
 python scripts/upload_clearml_dataset.py \
   --dataset_project Pathology/VLM \
-  --dataset_name pathgen_he_test_10 \
-  --folder data/he_test_10
+  --dataset_name quilt-1m_test_40 \
+  --folder data/quilt-1m
 ```
 
 **Windows PowerShell:**
@@ -270,13 +271,44 @@ python scripts/upload_clearml_dataset.py \
 ```powershell
 python scripts/upload_clearml_dataset.py `
   --dataset_project Pathology/VLM `
-  --dataset_name pathgen_he_test_10 `
-  --folder data/he_test_10
+  --dataset_name quilt-1m_test_40 `
+  --folder data\quilt-1m
 ```
 
 The script prints the dataset project, name, ID, and number of files.
 
-## 9. Run remote inference
+## 9. Run inference
+
+To run directly on the local Quilt-1M folder:
+
+**Bash:**
+
+```bash
+python scripts/run_remote_vlm.py \
+  --image_dir data/quilt-1m \
+  --model_name wisdomik/Quilt-Llava-v1.5-7b \
+  --prompt_variant standard \
+  --max_images 10 \
+  --load_4bit
+```
+
+**Windows PowerShell:**
+
+```powershell
+python scripts/run_remote_vlm.py `
+  --image_dir .\data\quilt-1m `
+  --model_name wisdomik/Quilt-Llava-v1.5-7b `
+  --prompt_variant standard `
+  --max_images 10 `
+  --load_4bit
+```
+
+This local path does not require ClearML credentials.
+
+For a safer prompt, replace `standard` with `safe`.
+
+If you want ClearML remote execution, upload the folder as a ClearML
+Dataset and run that dataset through a GPU agent:
 
 Make sure a ClearML agent is running on a GPU machine and listening to
 the queue you target (`gpu` by default).
@@ -288,8 +320,9 @@ python scripts/run_remote_vlm.py \
   --run_remote \
   --queue_name gpu \
   --dataset_project Pathology/VLM \
-  --dataset_name pathgen_he_test_10 \
+  --dataset_name quilt-1m_test_40 \
   --model_name wisdomik/Quilt-Llava-v1.5-7b \
+  --prompt_variant safe \
   --max_images 10 \
   --load_4bit
 ```
@@ -301,23 +334,53 @@ python scripts/run_remote_vlm.py `
   --run_remote `
   --queue_name gpu `
   --dataset_project Pathology/VLM `
-  --dataset_name pathgen_he_test_10 `
+  --dataset_name quilt-1m_test_40 `
   --model_name wisdomik/Quilt-Llava-v1.5-7b `
+  --prompt_variant safe `
   --max_images 10 `
   --load_4bit
 ```
 
 When `--run_remote` is set, the script registers the task with ClearML
 and immediately exits the local process. The agent then pulls the task,
-installs dependencies, and runs inference on the GPU.
+installs dependencies, and runs inference on the GPU. Do not combine
+`--run_remote` with `--image_dir`.
+
+## 10. Evaluate outputs and build report
+
+After downloading the output JSONL from ClearML (or running locally),
+generate proxy metrics and a Markdown report with good/bad examples:
+
+**Bash:**
+
+```bash
+python scripts/evaluate_quilt_1m_outputs.py \
+  --input outputs/vlm_outputs.jsonl \
+  --lookup quilt_1M_lookup.csv \
+  --image_dir data/quilt-1m \
+  --out-md outputs/quilt1m_report.md \
+  --out-csv outputs/quilt1m_metrics.csv
+```
+
+**Windows PowerShell:**
+
+```powershell
+python scripts/evaluate_quilt_1m_outputs.py `
+  --input outputs/vlm_outputs.jsonl `
+  --lookup quilt_1M_lookup.csv `
+  --image_dir .\data\quilt-1m `
+  --out-md outputs\quilt1m_report.md `
+  --out-csv outputs\quilt1m_metrics.csv
+```
 
 To run **locally** instead (e.g., for debugging on a small GPU), drop
 `--run_remote`:
 
 ```bash
 python scripts/run_remote_vlm.py \
-  --dataset_project Pathology/VLM \
-  --dataset_name pathgen_he_test_10 \
+  --image_dir data/quilt-1m \
+  --model_name wisdomik/Quilt-Llava-v1.5-7b \
+  --prompt_variant standard \
   --max_images 2
 ```
 
@@ -335,7 +398,8 @@ Each row contains:
 ```
 image_id, image_path, model_name, raw_response, json_valid,
 tissue_description, cellularity, architecture, visible_abnormalities,
-tumor_suspicious, evidence, artifacts, limitations, confidence,
+tumor_suspicious, evidence, artifacts, limitations,
+visual_description_confidence, conclusion_confidence,
 should_abstain, error
 ```
 
@@ -351,7 +415,8 @@ should_abstain, error
   "evidence": [],
   "artifacts": [],
   "limitations": [],
-  "confidence": "low/medium/high",
+  "visual_description_confidence": "low/medium/high",
+  "conclusion_confidence": "low/medium/high",
   "should_abstain": true
 }
 ```
@@ -424,8 +489,8 @@ is fetched via `Dataset.get(...).get_local_copy()`.
 **No images found in the ClearML Dataset.**
 Either the dataset is empty or the file extensions are not in the
 supported list (`.jpg .jpeg .png .webp .tif .tiff`). Re-run
-`prepare_pathgen_subset.py` and confirm `data/he_test_10/` contains
-JPEGs before uploading.
+`upload_clearml_dataset.py` for `data/quilt-1m/` and confirm the
+folder contains JPEGs before uploading.
 
 **PathGen JSON download fails with 401 / "gated dataset".**
 Open <https://huggingface.co/datasets/jamessyx/PathGen> while logged in,
@@ -554,28 +619,24 @@ Windows PowerShell:
 python scripts/inspect_dataset.py --pathgen_json .\PathGen-1.6M.json
 ```
 
-### Prepare 10 images
+### Run local inference
 
 Bash:
 
 ```bash
-python scripts/prepare_pathgen_subset.py \
-  --max_images 10 \
-  --out_dir data/he_test_10 \
-  --pathgen_json ./PathGen-1.6M.json \
-  --wsi_dir data/wsi \
-  --patch_size 672
+python scripts/upload_clearml_dataset.py \
+  --dataset_project Pathology/VLM \
+  --dataset_name quilt-1m_test_40 \
+  --folder data/quilt-1m
 ```
 
 Windows PowerShell:
 
 ```powershell
-python scripts/prepare_pathgen_subset.py `
-  --max_images 10 `
-  --out_dir data/he_test_10 `
-  --pathgen_json .\PathGen-1.6M.json `
-  --wsi_dir data\wsi `
-  --patch_size 672
+python scripts/upload_clearml_dataset.py `
+  --dataset_project Pathology/VLM `
+  --dataset_name quilt-1m_test_40 `
+  --folder .\data\quilt-1m
 ```
 
 ### Upload dataset
@@ -583,13 +644,13 @@ python scripts/prepare_pathgen_subset.py `
 Bash:
 
 ```bash
-python scripts/upload_clearml_dataset.py --dataset_project Pathology/VLM --dataset_name pathgen_he_test_10 --folder data/he_test_10
+python scripts/run_remote_vlm.py --image_dir data/quilt-1m --model_name wisdomik/Quilt-Llava-v1.5-7b --prompt_variant standard --max_images 10 --load_4bit
 ```
 
 Windows PowerShell:
 
 ```powershell
-python scripts/upload_clearml_dataset.py --dataset_project Pathology/VLM --dataset_name pathgen_he_test_10 --folder data/he_test_10
+python scripts/run_remote_vlm.py --image_dir .\data\quilt-1m --model_name wisdomik/Quilt-Llava-v1.5-7b --prompt_variant standard --max_images 10 --load_4bit
 ```
 
 ### Run remote inference
@@ -597,13 +658,13 @@ python scripts/upload_clearml_dataset.py --dataset_project Pathology/VLM --datas
 Bash:
 
 ```bash
-python scripts/run_remote_vlm.py --run_remote --queue_name gpu --dataset_project Pathology/VLM --dataset_name pathgen_he_test_10 --model_name wisdomik/Quilt-Llava-v1.5-7b --max_images 10 --load_4bit
+python scripts/run_remote_vlm.py --run_remote --queue_name gpu --dataset_project Pathology/VLM --dataset_name quilt-1m_test_40 --model_name wisdomik/Quilt-Llava-v1.5-7b --prompt_variant safe --max_images 10 --load_4bit
 ```
 
 Windows PowerShell:
 
 ```powershell
-python scripts/run_remote_vlm.py --run_remote --queue_name gpu --dataset_project Pathology/VLM --dataset_name pathgen_he_test_10 --model_name wisdomik/Quilt-Llava-v1.5-7b --max_images 10 --load_4bit
+python scripts/run_remote_vlm.py --run_remote --queue_name gpu --dataset_project Pathology/VLM --dataset_name quilt-1m_test_40 --model_name wisdomik/Quilt-Llava-v1.5-7b --prompt_variant safe --max_images 10 --load_4bit
 ```
 
 > Tip: ClearML reads `clearml.conf` from your home dir by default. To use

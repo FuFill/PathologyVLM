@@ -100,6 +100,13 @@ def render_list(items: list, indent: str = "    ") -> str:
     return "\n".join(f"{indent}- {item}" for item in items)
 
 
+def get_confidence_pair(v: dict) -> tuple[str, str]:
+    legacy = v.get("confidence", "")
+    desc = v.get("visual_description_confidence", legacy)
+    concl = v.get("conclusion_confidence", legacy)
+    return desc or "", concl or ""
+
+
 HEADER_NOTE = (
     "NOTE on 'ground truth':\n"
     "  PathGen 'reference_answer' is an auto-generated description, NOT a verified\n"
@@ -169,7 +176,9 @@ def render_txt(rows: list[dict]) -> str:
         out.append(f"    cellularity:        {v['cellularity']}")
         out.append(f"    architecture:       {v['architecture']}")
         out.append(f"    tumor_suspicious:   {v['tumor_suspicious']}")
-        out.append(f"    confidence:         {v['confidence']}")
+        desc_conf, concl_conf = get_confidence_pair(v)
+        out.append(f"    visual_desc_conf:   {desc_conf}")
+        out.append(f"    conclusion_conf:    {concl_conf}")
         out.append(f"    should_abstain:     {v['should_abstain']}")
         out.append("    visible_abnormalities:")
         out.append(render_list(v["visible_abnormalities"], indent="      "))
@@ -235,7 +244,7 @@ def render_md(rows: list[dict]) -> str:
         lines.append(
             f"| `{r['image_id']}` | {study} | {expected_organ or '-'} | "
             f"{model_organ or '-'} | **{match}** | "
-            f"{v['tumor_suspicious']} | {v['confidence']} | {v['should_abstain']} |"
+            f"{v['tumor_suspicious']} | {'/'.join(get_confidence_pair(v))} | {v['should_abstain']} |"
         )
     lines.append("")
 
@@ -287,7 +296,9 @@ def render_md(rows: list[dict]) -> str:
         lines.append(f"| cellularity | {v['cellularity'] or '_(empty)_'} |")
         lines.append(f"| architecture | {v['architecture'] or '_(empty)_'} |")
         lines.append(f"| tumor_suspicious | **{v['tumor_suspicious']}** |")
-        lines.append(f"| confidence | **{v['confidence']}** |")
+        desc_conf, concl_conf = get_confidence_pair(v)
+        lines.append(f"| visual_description_confidence | **{desc_conf}** |")
+        lines.append(f"| conclusion_confidence | **{concl_conf}** |")
         lines.append(f"| should_abstain | **{v['should_abstain']}** |")
         lines.append("")
 
@@ -360,7 +371,8 @@ def write_pretty_jsons(rows: list[dict]) -> None:
                 "evidence",
                 "artifacts",
                 "limitations",
-                "confidence",
+                "visual_description_confidence",
+                "conclusion_confidence",
                 "should_abstain",
             )
             if k in v
