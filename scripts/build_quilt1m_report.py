@@ -1,7 +1,7 @@
-"""Evaluate Quilt-1M inference outputs and build a small report.
+"""Evaluate Quilt-1M outputs and build a compact report.
 
-This script joins a model output JSONL file with ``quilt_1M_lookup.csv``
-and computes proxy metrics for:
+The report is based on the model's own structured outputs plus the
+Quilt-1M lookup CSV. It scores:
 
 * JSON validity
 * hallucination risk
@@ -10,8 +10,7 @@ and computes proxy metrics for:
 * visible-feature alignment
 * usefulness
 
-It also writes a Markdown report with good and bad examples that embeds
-the corresponding images.
+It also writes a Markdown report with a small set of good/bad examples.
 """
 
 from __future__ import annotations
@@ -83,9 +82,7 @@ def text_overlap(model_text: str, reference_text: str) -> tuple[float, float]:
     if not model_tokens or not reference_tokens:
         return 0.0, 0.0
     shared = model_tokens & reference_tokens
-    precision = len(shared) / len(model_tokens)
-    recall = len(shared) / len(reference_tokens)
-    return precision, recall
+    return len(shared) / len(model_tokens), len(shared) / len(reference_tokens)
 
 
 def coerce_bool(value: Any) -> bool:
@@ -98,14 +95,13 @@ def coerce_bool(value: Any) -> bool:
     return False
 
 
-def load_outputs(path: Path) -> list[dict[str, Any]]:
+def load_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as fin:
         for line in fin:
             line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
+            if line:
+                rows.append(json.loads(line))
     return rows
 
 
@@ -141,8 +137,6 @@ def score_row(model_row: dict[str, Any], lookup_row: dict[str, Any], image_dir: 
 
     evidence_tokens = normalize_tokens(" ".join(str(item) for item in evidence))
     text_tokens = normalize_tokens(model_text)
-    reference_tokens = normalize_tokens(reference_text)
-    shared_tokens = text_tokens & reference_tokens
     unsupported_diagnosis = (
         tumor_suspicious in {"yes", "no"}
         and json_valid
@@ -172,7 +166,7 @@ def score_row(model_row: dict[str, Any], lookup_row: dict[str, Any], image_dir: 
     usefulness = max(0.0, min(1.0, usefulness))
 
     image_path = str(lookup_row.get("image_path", ""))
-    image_rel = None
+    image_rel = ""
     if image_path:
         try:
             image_rel = (Path("..") / image_dir.relative_to(PROJECT_ROOT) / image_path).as_posix()
@@ -188,12 +182,7 @@ def score_row(model_row: dict[str, Any], lookup_row: dict[str, Any], image_dir: 
         "unsupported_diagnosis": unsupported_diagnosis,
         "visible_alignment": round(overlap, 4),
         "usefulness": round(usefulness, 4),
-        "reference_text": reference_text,
-        "model_text": model_text,
-        "image_rel": image_rel or "",
-        "shared_token_count": len(shared_tokens),
-        "evidence_count": len(evidence_tokens),
-        "visible_abnormalities_count": len(visible_abnormalities),
+        "image_rel": image_rel,
         "model": model_row,
         "lookup": lookup_row,
     }
@@ -209,9 +198,6 @@ def write_metrics_csv(rows: list[dict[str, Any]], out_csv: Path) -> None:
         "unsupported_diagnosis",
         "visible_alignment",
         "usefulness",
-        "shared_token_count",
-        "evidence_count",
-        "visible_abnormalities_count",
         "image_rel",
     ]
     with out_csv.open("w", encoding="utf-8", newline="") as fout:
@@ -221,19 +207,27 @@ def write_metrics_csv(rows: list[dict[str, Any]], out_csv: Path) -> None:
             writer.writerow(row)
 
 
+def _confidence_pair(v: dict[str, Any]) -> tuple[str, str]:
+    legacy = str(v.get("confidence", "") or "")
+    return (
+        str(v.get("visual_description_confidence", legacy) or legacy),
+        str(v.get("conclusion_confidence", legacy) or legacy),
+    )
+
+
 def render_examples(title: str, rows: list[dict[str, Any]], limit: int) -> list[str]:
-    lines: list[str] = [f"## {title}\n"]
+    lines: list[str] = [f"## {title}"]
     if not rows:
-        lines.append("_No examples found._\n")
+        lines.append("_No examples found._")
         return lines
 
     for row in rows[:limit]:
         model = row["model"]
         lookup = row["lookup"]
         img = row["image_rel"].replace("\\", "/")
-        lines.append(f"### {row['image_id']}\n")
+        lines.append(f"### {row['image_id']}")
         if img:
-            lines.append(f"![]({img})\n")
+            lines.append(f"![]({img})")
         lines.append("| metric | value |")
         lines.append("|---|---|")
         lines.append(f"| json_valid | `{row['json_valid']}` |")
@@ -247,10 +241,8 @@ def render_examples(title: str, rows: list[dict[str, Any]], limit: int) -> list[
         lines.append(f"- tissue_organ: `{model.get('tissue_organ', '')}`")
         lines.append(f"- tissue_description: {model.get('tissue_description', '')}")
         lines.append(f"- tumor_suspicious: `{model.get('tumor_suspicious', '')}`")
-        lines.append(
-            f"- confidences: `{model.get('visual_description_confidence', model.get('confidence', ''))} / "
-            f"{model.get('conclusion_confidence', model.get('confidence', ''))}`"
-        )
+        desc_conf, concl_conf = _confidence_pair(model)
+        lines.append(f"- confidences: `{desc_conf} / {concl_conf}`")
         lines.append(f"- evidence: {model.get('evidence', [])}")
         lines.append("")
         lines.append("**Reference text**")
@@ -276,14 +268,12 @@ def main() -> int:
     out_md = Path(args.out_md)
     out_csv = Path(args.out_csv)
 
-    if not in_path.exists():
-        print(f"[evaluate_quilt_1m] ERROR: output file not found: {in_path}", file=sys.stderr)
-        return 1
-    if not lookup_path.exists():
-        print(f"[evaluate_quilt_1m] ERROR: lookup CSV not found: {lookup_path}", file=sys.stderr)
-        return 1
+    for path, label in ((in_path, "output JSONL"), (lookup_path, "lookup CSV")):
+        if not path.exists():
+            print(f"[build_quilt1m_report] ERROR: {label} not found: {path}", file=sys.stderr)
+            return 1
 
-    model_rows = load_outputs(in_path)
+    model_rows = load_jsonl(in_path)
     wanted = {Path(str(r.get("image_path", "")).replace("\\", "/")).name.lower() for r in model_rows}
     wanted.discard("")
     lookup_rows = load_lookup_for_images(lookup_path, wanted)
@@ -298,9 +288,8 @@ def main() -> int:
             continue
         joined.append(score_row(row, lookup_row, image_dir))
 
-    joined.sort(key=lambda r: (r["usefulness"], r["visible_alignment"]), reverse=True)
     if not joined:
-        print("[evaluate_quilt_1m] ERROR: no joined rows found.", file=sys.stderr)
+        print("[build_quilt1m_report] ERROR: no joined rows found.", file=sys.stderr)
         return 1
 
     counts = Counter()
@@ -312,7 +301,6 @@ def main() -> int:
     avg_alignment = sum(r["visible_alignment"] for r in joined) / len(joined)
     avg_usefulness = sum(r["usefulness"] for r in joined) / len(joined)
 
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
     write_metrics_csv(joined, out_csv)
 
     good_rows = [r for r in joined if not r["hallucination_risk"] and not r["unsupported_diagnosis"]]
@@ -321,9 +309,9 @@ def main() -> int:
         key=lambda r: (r["usefulness"], int(not r["hallucination_risk"]), int(not r["unsupported_diagnosis"])),
     )
 
-    out_md.parent.mkdir(parents=True, exist_ok=True)
     md_lines: list[str] = []
-    md_lines.append("# Quilt-1M evaluation report\n")
+    md_lines.append("# Quilt-1M evaluation report")
+    md_lines.append("")
     md_lines.append("| metric | value |")
     md_lines.append("|---|---|")
     md_lines.append(f"| images evaluated | {counts['n']} |")
@@ -335,15 +323,17 @@ def main() -> int:
     md_lines.append(f"| mean usefulness | {avg_usefulness:.3f} |")
     md_lines.append(f"| lookup misses | {missing} |")
     md_lines.append("")
-    md_lines.append("> Metrics are proxy scores based on the lookup CSV and the model's structured text; they still need manual review.\n")
+    md_lines.append("> Proxy metrics are based on the lookup CSV and the model's structured text.")
+    md_lines.append("")
     md_lines.extend(render_examples("Good examples", good_rows, args.good_count))
+    md_lines.append("")
     md_lines.extend(render_examples("Bad examples", bad_rows, args.bad_count))
-    out_md.write_text("\n".join(md_lines), encoding="utf-8")
+    out_md.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
 
-    print(f"[evaluate_quilt_1m] wrote {out_csv}")
-    print(f"[evaluate_quilt_1m] wrote {out_md}")
+    print(f"[build_quilt1m_report] wrote {out_csv}")
+    print(f"[build_quilt1m_report] wrote {out_md}")
     print(
-        f"[evaluate_quilt_1m] n={counts['n']} json_valid={counts['json_valid']} "
+        f"[build_quilt1m_report] n={counts['n']} json_valid={counts['json_valid']} "
         f"abstain={counts['abstain']} hallucination_risk={counts['hallucination_risk']} "
         f"unsupported_diagnosis={counts['unsupported_diagnosis']}"
     )

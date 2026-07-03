@@ -346,32 +346,25 @@ and immediately exits the local process. The agent then pulls the task,
 installs dependencies, and runs inference on the GPU. Do not combine
 `--run_remote` with `--image_dir`.
 
-## 10. Evaluate outputs and build report
+## 11. Inspect one image
 
-After downloading the output JSONL from ClearML (or running locally),
-generate proxy metrics and a Markdown report with good/bad examples:
+To see exactly what the model printed and all CSV fields for one image:
 
 **Bash:**
 
 ```bash
-python scripts/evaluate_quilt_1m_outputs.py \
-  --input outputs/vlm_outputs.jsonl \
-  --lookup quilt_1M_lookup.csv \
-  --image_dir data/quilt-1m \
-  --out-md outputs/quilt1m_report.md \
-  --out-csv outputs/quilt1m_metrics.csv
+python scripts/inspect_quilt_1m_image.py \
+  --image 04dfb3d9-d5fe-4948-bac9-2a950476ca1d_1.jpg
 ```
 
 **Windows PowerShell:**
 
 ```powershell
-python scripts/evaluate_quilt_1m_outputs.py `
-  --input outputs/vlm_outputs.jsonl `
-  --lookup quilt_1M_lookup.csv `
-  --image_dir .\data\quilt-1m `
-  --out-md outputs\quilt1m_report.md `
-  --out-csv outputs\quilt1m_metrics.csv
+python scripts/inspect_quilt_1m_image.py `
+  --image 04dfb3d9-d5fe-4948-bac9-2a950476ca1d_1.jpg
 ```
+
+You can pass `--image` as a basename, `image_id`, or any unique path fragment.
 
 To run **locally** instead (e.g., for debugging on a small GPU), drop
 `--run_remote`:

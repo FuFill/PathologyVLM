@@ -60,14 +60,27 @@ SAFE_PROMPT = """You are a pathology image assistant. Analyze the provided H&E h
 
 Important rules:
 1. Do not provide a final clinical diagnosis.
-2. Describe only morphological features that are clearly visible.
-3. If the tissue origin is not clear enough, use tissue_organ="uncertain".
+2. Describe only morphological features that are clearly visible in this exact image.
+3. If the tissue origin is not clearly supported by explicit visible morphology,
+   you MUST use tissue_organ="uncertain". Never guess the organ.
 4. If the image is blurry, cropped, heavily artifacted, non-diagnostic, or the
    evidence for any conclusion is weak or contradictory, you MUST set
    should_abstain=true.
-5. When should_abstain=true, keep tumor_suspicious="uncertain" unless a strong
-   visible basis is present, and keep evidence minimal and factual.
-6. Return ONLY a single JSON object. No prose before or after. No markdown
+5. You are NOT allowed to output a diagnosis name (for example: carcinoma,
+   adenocarcinoma, lymphoma, melanoma, metastasis, benign/malignant diagnosis).
+   Use only descriptive morphology.
+6. tumor_suspicious can be "yes" or "no" ONLY when you provide explicit visual
+   evidence in the evidence list from this image. If explicit evidence is absent,
+   set tumor_suspicious="uncertain" and should_abstain=true.
+7. Evidence must be concrete and visual (e.g. gland crowding, nuclear pleomorphism,
+   mitotic figures, necrosis, keratinization, mucin, stromal reaction). Do not use
+   generic claims like "looks abnormal" or "possible neoplastic process" without
+   specific morphology.
+8. If should_abstain=true:
+   - tissue_organ must be "uncertain" unless organ-defining structures are explicit.
+   - tumor_suspicious should usually be "uncertain".
+   - keep evidence minimal, factual, and image-grounded.
+9. Return ONLY a single JSON object. No prose before or after. No markdown
    fences. No backslash escapes inside field names.
 
 tissue_organ must be exactly ONE of:
@@ -101,9 +114,21 @@ PROMPTS = {
     "safe": SAFE_PROMPT,
 }
 
+PROMPT_VERSIONS = {
+    "standard": "standard_v1",
+    "safe": "safe_v2_evidence_gated",
+}
+
 
 def get_prompt(variant: str) -> str:
     try:
         return PROMPTS[variant]
+    except KeyError as exc:
+        raise ValueError(f"Unknown prompt variant: {variant!r}") from exc
+
+
+def get_prompt_version(variant: str) -> str:
+    try:
+        return PROMPT_VERSIONS[variant]
     except KeyError as exc:
         raise ValueError(f"Unknown prompt variant: {variant!r}") from exc
