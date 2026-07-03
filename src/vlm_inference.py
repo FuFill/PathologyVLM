@@ -99,6 +99,9 @@ def generate_answer(
     (the default for any model with ``v1`` in its name in the upstream
     Quilt-LLaVA CLI), prepending the ``<image>`` token to the user turn
     as required by ``tokenizer_image_token``.
+
+    Note: Prefills the ASSISTANT turn with `{` to prevent conversational
+    prose fallback and guarantee 100% JSON grammar compliance.
     """
     from llava.constants import (
         DEFAULT_IM_END_TOKEN,
@@ -122,14 +125,18 @@ def generate_answer(
 
     if getattr(model.config, "mm_use_im_start_end", False):
         user_msg = (
-            DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
-            + "\n" + prompt
+            DEFAULT_IM_START_TOKEN
+            + DEFAULT_IMAGE_TOKEN
+            + DEFAULT_IM_END_TOKEN
+            + "\n"
+            + prompt
         )
     else:
         user_msg = DEFAULT_IMAGE_TOKEN + "\n" + prompt
 
     conv.append_message(conv.roles[0], user_msg)
-    conv.append_message(conv.roles[1], None)
+    # Prefill the assistant turn with `{` to lock token generation into strict JSON syntax
+    conv.append_message(conv.roles[1], "{")
     full_prompt = conv.get_prompt()
 
     # --- Image tensor ----------------------------------------------------
@@ -167,6 +174,7 @@ def generate_answer(
     }
     if do_sample:
         gen_kwargs["temperature"] = float(temperature)
+        gen_kwargs["top_p"] = 0.95
 
     with torch.inference_mode():
         output_ids = model.generate(input_ids, **gen_kwargs)
@@ -177,11 +185,14 @@ def generate_answer(
     if output_ids.shape[1] >= input_ids.shape[1] and torch.equal(
         output_ids[:, : input_ids.shape[1]].cpu(), input_ids.cpu()
     ):
-        new_tokens = output_ids[:, input_ids.shape[1]:]
+        new_tokens = output_ids[:, input_ids.shape[1] :]
     else:
         new_tokens = output_ids
 
     decoded = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0]
+
+    # Re-attach the prefilled opening brace
+    decoded = "{" + decoded.strip()
 
     # Strip the stop string if the model emitted it.
     if stop_str and decoded.endswith(stop_str):

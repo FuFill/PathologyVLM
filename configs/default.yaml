@@ -9,9 +9,12 @@ model_name: wisdomik/Quilt-Llava-v1.5-7b
 
 output_dir: outputs
 max_images: 10
-max_new_tokens: 512
-temperature: 0.0
+max_new_tokens: 768
+temperature: 0.1
 load_4bit: true
+
+top_p: 0.95 # Nucleus sampling pairs well with low temperature for descriptive lists
+repetition_penalty: 1.08
 
 # PathGen-1.6M (jamessyx/PathGen) data preparation defaults.
 # These are consumed by scripts/prepare_pathgen_subset.py.

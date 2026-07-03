@@ -31,7 +31,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.prompt_templates import get_prompt
 
-
 # Columns in the output CSV / JSONL. Keep stable for downstream consumers.
 OUTPUT_FIELDS = [
     "image_id",
@@ -195,6 +194,7 @@ def _bootstrap_llava() -> None:
     # specific incompatible submodule.
     try:
         import importlib
+
         importlib.import_module("llava")  # probe only
         already = True
     except ImportError:
@@ -202,9 +202,15 @@ def _bootstrap_llava() -> None:
 
     if not already:
         import subprocess
+
         print(f"[run_remote_vlm] Installing llava (--no-deps) from {QUILT_LLAVA_GIT}")
         cmd = [
-            sys.executable, "-m", "pip", "install", "--no-deps", "--no-cache-dir",
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--no-cache-dir",
             QUILT_LLAVA_GIT,
         ]
         res = subprocess.run(cmd, capture_output=True, text=True)
@@ -216,6 +222,7 @@ def _bootstrap_llava() -> None:
     # Make sure any half-imported ``llava`` modules from a prior failed
     # import attempt are evicted; then apply patches and import fresh.
     import sys as _sys
+
     for key in list(_sys.modules):
         if key == "llava" or key.startswith("llava."):
             del _sys.modules[key]
@@ -224,16 +231,28 @@ def _bootstrap_llava() -> None:
     _stub_llava_mpt()
 
     import importlib
+
     importlib.invalidate_caches()
     import llava  # noqa: F401
+
     print(f"[run_remote_vlm] llava importable from: {llava.__file__}")
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Quilt-LLaVA inference locally or via ClearML.")
-    parser.add_argument("--project_name", default="Pathology/VLM", help="ClearML project name.")
-    parser.add_argument("--task_name", default="pathgen_llava_test_10_promptv2", help="ClearML task name.")
-    parser.add_argument("--queue_name", default="default", help="ClearML queue for remote execution.")
+    parser = argparse.ArgumentParser(
+        description="Run Quilt-LLaVA inference locally or via ClearML."
+    )
+    parser.add_argument(
+        "--project_name", default="Pathology/VLM", help="ClearML project name."
+    )
+    parser.add_argument(
+        "--task_name",
+        default="pathgen_llava_test_10_promptv2",
+        help="ClearML task name.",
+    )
+    parser.add_argument(
+        "--queue_name", default="default", help="ClearML queue for remote execution."
+    )
 
     parser.add_argument(
         "--image_dir",
@@ -246,8 +265,12 @@ def _parse_args() -> argparse.Namespace:
         default="standard",
         help="Which JSON prompt template to use.",
     )
-    parser.add_argument("--dataset_project", default="Pathology/VLM", help="ClearML dataset project.")
-    parser.add_argument("--dataset_name", default="pathgen_he_test_10", help="ClearML dataset name.")
+    parser.add_argument(
+        "--dataset_project", default="Pathology/VLM", help="ClearML dataset project."
+    )
+    parser.add_argument(
+        "--dataset_name", default="pathgen_he_test_10", help="ClearML dataset name."
+    )
     parser.add_argument(
         "--metadata_csv",
         default="",
@@ -263,11 +286,26 @@ def _parse_args() -> argparse.Namespace:
         help="Hugging Face model id of the VLM.",
     )
 
-    parser.add_argument("--output_dir", default="outputs", help="Local output directory.")
-    parser.add_argument("--max_images", type=int, default=10, help="Maximum number of images to process.")
-    parser.add_argument("--max_new_tokens", type=int, default=512, help="Generation length limit.")
-    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0 = greedy).")
-    parser.add_argument("--load_4bit", action="store_true", help="Load model with bitsandbytes 4-bit quantization.")
+    parser.add_argument(
+        "--output_dir", default="outputs", help="Local output directory."
+    )
+    parser.add_argument(
+        "--max_images",
+        type=int,
+        default=10,
+        help="Maximum number of images to process.",
+    )
+    parser.add_argument(
+        "--max_new_tokens", type=int, default=768, help="Generation length limit."
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=0.1, help="Sampling temperature."
+    )
+    parser.add_argument(
+        "--load_4bit",
+        action="store_true",
+        help="Load model with bitsandbytes 4-bit quantization.",
+    )
     parser.add_argument(
         "--run_remote",
         action="store_true",
@@ -305,7 +343,9 @@ def _source_dir_name(source: Any) -> str:
     return value or "unknown"
 
 
-def _first_non_empty(row: dict[str, Any], keys: tuple[str, ...], default: Any = "") -> Any:
+def _first_non_empty(
+    row: dict[str, Any], keys: tuple[str, ...], default: Any = ""
+) -> Any:
     for key in keys:
         value = row.get(key)
         if value is None:
@@ -367,11 +407,15 @@ def _load_metadata_rows(path: Path) -> list[dict[str, Any]]:
         return list(reader)
 
 
-def _build_metadata_lookup(rows: list[dict[str, Any]]) -> tuple[dict[str, deque[int]], dict[str, deque[int]]]:
+def _build_metadata_lookup(
+    rows: list[dict[str, Any]],
+) -> tuple[dict[str, deque[int]], dict[str, deque[int]]]:
     by_basename: dict[str, deque[int]] = defaultdict(deque)
     by_tail: dict[str, deque[int]] = defaultdict(deque)
     for idx, row in enumerate(rows):
-        patch_ref = _first_non_empty(row, ("patch_path", "image_path", "minio_path"), default="")
+        patch_ref = _first_non_empty(
+            row, ("patch_path", "image_path", "minio_path"), default=""
+        )
         basename = Path(_norm_path(patch_ref)).name.lower()
         if basename:
             by_basename[basename].append(idx)
@@ -448,9 +492,15 @@ def _make_metadata_record(
         "y": _first_non_empty(metadata_row, ("y",), default=""),
         "patch_path": patch_rel,
         "slide_id": _first_non_empty(metadata_row, ("slide_id",), default=""),
-        "patch_id": _first_non_empty(metadata_row, ("patch_id",), default=img_path.stem),
-        "attention_score": _first_non_empty(metadata_row, ("attention_score",), default=""),
-        "attention_rank": _first_non_empty(metadata_row, ("attention_rank",), default=""),
+        "patch_id": _first_non_empty(
+            metadata_row, ("patch_id",), default=img_path.stem
+        ),
+        "attention_score": _first_non_empty(
+            metadata_row, ("attention_score",), default=""
+        ),
+        "attention_rank": _first_non_empty(
+            metadata_row, ("attention_rank",), default=""
+        ),
         "tile_size": _first_non_empty(metadata_row, ("tile_size",), default=""),
         "tile_in_mask": _first_non_empty(metadata_row, ("tile_in_mask",), default=""),
         "dataset": _first_non_empty(metadata_row, ("dataset",), default=""),
@@ -459,7 +509,9 @@ def _make_metadata_record(
         "mil_task_id": _first_non_empty(metadata_row, ("task_id",), default=""),
         "mil_model_name": _first_non_empty(metadata_row, ("model_name",), default=""),
         "minio_path": _first_non_empty(metadata_row, ("minio_path",), default=""),
-        "original_patch_path": _first_non_empty(metadata_row, ("patch_path",), default=""),
+        "original_patch_path": _first_non_empty(
+            metadata_row, ("patch_path",), default=""
+        ),
     }
 
 
@@ -563,7 +615,10 @@ def main() -> int:
         try:
             from clearml import Dataset, Task
         except ImportError as exc:
-            print(f"[run_remote_vlm] ERROR: clearml is not installed: {exc}", file=sys.stderr)
+            print(
+                f"[run_remote_vlm] ERROR: clearml is not installed: {exc}",
+                file=sys.stderr,
+            )
             return 2
 
         task = Task.init(
@@ -592,7 +647,9 @@ def main() -> int:
                 task.set_packages(str(req_path))
                 print(f"[run_remote_vlm] Pinned remote packages from: {req_path}")
             else:
-                print(f"[run_remote_vlm] WARNING: requirements.txt not found at {req_path}")
+                print(
+                    f"[run_remote_vlm] WARNING: requirements.txt not found at {req_path}"
+                )
         except Exception as exc:  # noqa: BLE001
             print(f"[run_remote_vlm] WARNING: could not set packages: {exc}")
 
@@ -663,13 +720,17 @@ def main() -> int:
         metadata_csv_path = _resolve_metadata_csv(dataset_path, args.metadata_csv)
         if metadata_csv_path is not None:
             metadata_rows = _load_metadata_rows(metadata_csv_path)
-            metadata_by_basename, metadata_by_tail = _build_metadata_lookup(metadata_rows)
+            metadata_by_basename, metadata_by_tail = _build_metadata_lookup(
+                metadata_rows
+            )
             print(
                 f"[run_remote_vlm] Metadata CSV: {metadata_csv_path} "
                 f"(rows={len(metadata_rows)})"
             )
         else:
-            print("[run_remote_vlm] Metadata CSV: not found (continuing without patch metadata).")
+            print(
+                "[run_remote_vlm] Metadata CSV: not found (continuing without patch metadata)."
+            )
     except Exception as exc:  # noqa: BLE001
         print(f"[run_remote_vlm] ERROR loading metadata CSV: {exc}", file=sys.stderr)
         traceback.print_exc()
@@ -699,7 +760,10 @@ def main() -> int:
         )
         print(f"[run_remote_vlm] context_len={context_len}")
     except Exception as exc:  # noqa: BLE001
-        print(f"[run_remote_vlm] ERROR loading model {args.model_name!r}: {exc}", file=sys.stderr)
+        print(
+            f"[run_remote_vlm] ERROR loading model {args.model_name!r}: {exc}",
+            file=sys.stderr,
+        )
         traceback.print_exc()
         return 1
 
@@ -765,7 +829,9 @@ def main() -> int:
                         image=im.convert("RGB"),
                     )
             except Exception as exc:  # noqa: BLE001
-                print(f"[run_remote_vlm] WARNING: could not log image {img_path}: {exc}")
+                print(
+                    f"[run_remote_vlm] WARNING: could not log image {img_path}: {exc}"
+                )
 
             try:
                 raw = generate_answer(
@@ -877,10 +943,16 @@ def main() -> int:
             print(f"[run_remote_vlm] WARNING: could not report single values: {exc}")
 
         try:
-            task.upload_artifact(name="vlm_outputs_jsonl", artifact_object=str(jsonl_path))
+            task.upload_artifact(
+                name="vlm_outputs_jsonl", artifact_object=str(jsonl_path)
+            )
             task.upload_artifact(name="vlm_outputs_csv", artifact_object=str(csv_path))
-            task.upload_artifact(name="vlm_metadata", artifact_object=str(vlm_metadata_path))
-            task.upload_artifact(name="visualizations", artifact_object=str(visualizations_tar_path))
+            task.upload_artifact(
+                name="vlm_metadata", artifact_object=str(vlm_metadata_path)
+            )
+            task.upload_artifact(
+                name="visualizations", artifact_object=str(visualizations_tar_path)
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"[run_remote_vlm] WARNING: artifact upload failed: {exc}")
 

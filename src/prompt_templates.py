@@ -54,7 +54,31 @@ Return JSON with exactly these fields, in this order:
   "should_abstain": true
 }"""
 
-STANDARD_PROMPT = _BASE_RULES
+STANDARD_PROMPT = """You are an expert pathology AI assistant analyzing an H&E histology tile.
+Anatomical Context: Known Lymph Node section (evaluating for metastatic adenocarcinoma).
+
+Important instructions:
+1. Do not provide a final clinical diagnosis name. Describe visual morphology only.
+2. Evaluate cellularity and architecture specifically relative to lymphoid tissue.
+3. Identify foreign cell populations (e.g., metastatic epithelial sheets, glandular nests, nuclear pleomorphism) infiltrating the lymphoid stroma.
+4. Return ONLY a single valid JSON object. No prose, no markdown fences, no backslashes.
+
+Return JSON with exactly these fields:
+{
+  "tissue_organ": "lymph_node",
+  "tissue_description": "<one concise sentence on predominant tissue and cell structures>",
+  "predominant_cell_type": "<lymphoid | epithelial | stromal | necrotic>",
+  "cellularity": "<low | moderate | high>",
+  "architecture": "<preserved lymphoid | mildly distorted | severely effaced/distorted>",
+  "visible_abnormalities": ["<specific visual feature e.g. enlarged pleomorphic nuclei>", "..."],
+  "nuclear_atypia": "<absent | mild | severe>",
+  "mitotic_activity": "<absent | low | high>",
+  "tumor_suspicious": "<yes | no | uncertain>",
+  "evidence": ["<concrete morphological feature justifying suspicion>", "..."],
+  "artifacts": ["<blur | fold | none>"],
+  "visual_description_confidence": "<low | medium | high>",
+  "should_abstain": false
+}"""
 
 SAFE_PROMPT = """You are a pathology image assistant. Analyze the provided H&E histology image.
 
