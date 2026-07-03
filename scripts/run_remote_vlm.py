@@ -13,10 +13,13 @@ this constraint and requires a structured JSON reply.
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import sys
+import tarfile
 import traceback
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +51,26 @@ OUTPUT_FIELDS = [
     "visual_description_confidence",
     "conclusion_confidence",
     "should_abstain",
+    "source",
+    "label",
+    "prediction",
+    "confidence",
+    "x",
+    "y",
+    "patch_path",
+    "slide_id",
+    "patch_id",
+    "attention_score",
+    "attention_rank",
+    "tile_size",
+    "tile_in_mask",
+    "dataset",
+    "split",
+    "fold",
+    "mil_task_id",
+    "mil_model_name",
+    "minio_path",
+    "original_patch_path",
     "error",
 ]
 
@@ -225,6 +248,14 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset_project", default="Pathology/VLM", help="ClearML dataset project.")
     parser.add_argument("--dataset_name", default="pathgen_he_test_10", help="ClearML dataset name.")
+    parser.add_argument(
+        "--metadata_csv",
+        default="",
+        help=(
+            "Patch metadata CSV. If omitted, auto-detect a single CSV in dataset root. "
+            "Used to carry source/label/prediction/confidence/x/y into outputs."
+        ),
+    )
 
     parser.add_argument(
         "--model_name",
@@ -252,6 +283,252 @@ def _csv_safe(value: Any) -> Any:
     if value is None:
         return ""
     return value
+
+
+def _norm_path(text: Any) -> str:
+    return str(text or "").replace("\\", "/").strip()
+
+
+def _tail_path_key(text: Any, depth: int = 3) -> str:
+    norm = _norm_path(text).lower()
+    if not norm:
+        return ""
+    parts = [p for p in norm.split("/") if p]
+    if not parts:
+        return ""
+    return "/".join(parts[-depth:])
+
+
+def _source_dir_name(source: Any) -> str:
+    value = str(source or "unknown").strip().lower().replace(" ", "_")
+    value = value.replace("_", "-")
+    return value or "unknown"
+
+
+def _first_non_empty(row: dict[str, Any], keys: tuple[str, ...], default: Any = "") -> Any:
+    for key in keys:
+        value = row.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            value = value.strip()
+            if value:
+                return value
+        elif value != "":
+            return value
+    return default
+
+
+def _resolve_metadata_csv(dataset_path: Path, metadata_csv_arg: str) -> Path | None:
+    if metadata_csv_arg:
+        candidate = Path(metadata_csv_arg)
+        if candidate.is_absolute() and candidate.is_file():
+            return candidate
+        local = (dataset_path / metadata_csv_arg).resolve()
+        if local.is_file():
+            return local
+        repo_local = (PROJECT_ROOT / metadata_csv_arg).resolve()
+        if repo_local.is_file():
+            return repo_local
+        raise FileNotFoundError(
+            f"Metadata CSV not found: {metadata_csv_arg!r} "
+            f"(checked absolute path, dataset-relative, and repo-relative locations)."
+        )
+
+    root_csv = sorted(dataset_path.glob("*.csv"))
+    if len(root_csv) == 1:
+        return root_csv[0]
+    if len(root_csv) > 1:
+        preferred = [p for p in root_csv if "metadata" in p.name.lower()]
+        if len(preferred) == 1:
+            return preferred[0]
+        raise RuntimeError(
+            "Multiple CSV files found in dataset root; pass --metadata_csv explicitly."
+        )
+
+    nested_csv = sorted(dataset_path.rglob("*.csv"))
+    if len(nested_csv) == 1:
+        return nested_csv[0]
+    if len(nested_csv) > 1:
+        preferred = [p for p in nested_csv if "metadata" in p.name.lower()]
+        if len(preferred) == 1:
+            return preferred[0]
+        raise RuntimeError(
+            "Multiple CSV files found in dataset; pass --metadata_csv explicitly."
+        )
+    return None
+
+
+def _load_metadata_rows(path: Path) -> list[dict[str, Any]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as fin:
+        reader = csv.DictReader(fin)
+        if reader.fieldnames is None:
+            raise ValueError(f"Metadata CSV has no header: {path}")
+        return list(reader)
+
+
+def _build_metadata_lookup(rows: list[dict[str, Any]]) -> tuple[dict[str, deque[int]], dict[str, deque[int]]]:
+    by_basename: dict[str, deque[int]] = defaultdict(deque)
+    by_tail: dict[str, deque[int]] = defaultdict(deque)
+    for idx, row in enumerate(rows):
+        patch_ref = _first_non_empty(row, ("patch_path", "image_path", "minio_path"), default="")
+        basename = Path(_norm_path(patch_ref)).name.lower()
+        if basename:
+            by_basename[basename].append(idx)
+        tail = _tail_path_key(patch_ref, depth=3)
+        if tail:
+            by_tail[tail].append(idx)
+    return by_basename, by_tail
+
+
+def _match_metadata_row(
+    img_path: Path,
+    dataset_path: Path,
+    metadata_rows: list[dict[str, Any]],
+    by_basename: dict[str, deque[int]],
+    by_tail: dict[str, deque[int]],
+) -> dict[str, Any] | None:
+    try:
+        rel = img_path.relative_to(dataset_path)
+        rel_norm = rel.as_posix().lower()
+    except ValueError:
+        rel_norm = _norm_path(img_path).lower()
+
+    tail = _tail_path_key(rel_norm, depth=3)
+    basename = img_path.name.lower()
+
+    if tail and tail in by_tail and by_tail[tail]:
+        return metadata_rows[by_tail[tail].popleft()]
+    if basename in by_basename and by_basename[basename]:
+        return metadata_rows[by_basename[basename].popleft()]
+    return None
+
+
+def _make_metadata_record(
+    img_path: Path,
+    dataset_path: Path,
+    metadata_row: dict[str, Any] | None,
+) -> dict[str, Any]:
+    patch_rel: str
+    try:
+        patch_rel = img_path.relative_to(dataset_path).as_posix()
+    except ValueError:
+        patch_rel = _norm_path(img_path)
+
+    if metadata_row is None:
+        return {
+            "source": "",
+            "label": "",
+            "prediction": "",
+            "confidence": "",
+            "x": "",
+            "y": "",
+            "patch_path": patch_rel,
+            "slide_id": "",
+            "patch_id": img_path.stem,
+            "attention_score": "",
+            "attention_rank": "",
+            "tile_size": "",
+            "tile_in_mask": "",
+            "dataset": "",
+            "split": "",
+            "fold": "",
+            "mil_task_id": "",
+            "mil_model_name": "",
+            "minio_path": "",
+            "original_patch_path": "",
+        }
+
+    return {
+        "source": _first_non_empty(metadata_row, ("source",), default=""),
+        "label": _first_non_empty(metadata_row, ("label", "slide_label"), default=""),
+        "prediction": _first_non_empty(metadata_row, ("prediction",), default=""),
+        "confidence": _first_non_empty(metadata_row, ("confidence",), default=""),
+        "x": _first_non_empty(metadata_row, ("x",), default=""),
+        "y": _first_non_empty(metadata_row, ("y",), default=""),
+        "patch_path": patch_rel,
+        "slide_id": _first_non_empty(metadata_row, ("slide_id",), default=""),
+        "patch_id": _first_non_empty(metadata_row, ("patch_id",), default=img_path.stem),
+        "attention_score": _first_non_empty(metadata_row, ("attention_score",), default=""),
+        "attention_rank": _first_non_empty(metadata_row, ("attention_rank",), default=""),
+        "tile_size": _first_non_empty(metadata_row, ("tile_size",), default=""),
+        "tile_in_mask": _first_non_empty(metadata_row, ("tile_in_mask",), default=""),
+        "dataset": _first_non_empty(metadata_row, ("dataset",), default=""),
+        "split": _first_non_empty(metadata_row, ("split",), default=""),
+        "fold": _first_non_empty(metadata_row, ("fold",), default=""),
+        "mil_task_id": _first_non_empty(metadata_row, ("task_id",), default=""),
+        "mil_model_name": _first_non_empty(metadata_row, ("model_name",), default=""),
+        "minio_path": _first_non_empty(metadata_row, ("minio_path",), default=""),
+        "original_patch_path": _first_non_empty(metadata_row, ("patch_path",), default=""),
+    }
+
+
+def _write_vlm_metadata_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    fieldnames = [
+        "image_id",
+        "patch_path",
+        "source",
+        "label",
+        "prediction",
+        "confidence",
+        "x",
+        "y",
+        "model_name",
+        "json_valid",
+        "tissue_organ",
+        "tissue_description",
+        "cellularity",
+        "architecture",
+        "visible_abnormalities",
+        "tumor_suspicious",
+        "evidence",
+        "artifacts",
+        "limitations",
+        "visual_description_confidence",
+        "conclusion_confidence",
+        "should_abstain",
+        "error",
+        "slide_id",
+        "patch_id",
+        "attention_score",
+        "attention_rank",
+        "tile_size",
+        "tile_in_mask",
+        "dataset",
+        "split",
+        "fold",
+        "mil_task_id",
+        "mil_model_name",
+        "minio_path",
+        "original_patch_path",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as fout:
+        writer = csv.DictWriter(fout, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: _csv_safe(row.get(k, "")) for k in fieldnames})
+
+
+def _build_visualizations_tar(
+    tar_path: Path,
+    vis_items: list[dict[str, Any]],
+) -> None:
+    with tarfile.open(tar_path, "w:gz") as tf:
+        seen: set[tuple[str, str]] = set()
+        for item in vis_items:
+            src = Path(str(item.get("image_path", "")))
+            if not src.is_file():
+                continue
+            source_dir = _source_dir_name(item.get("source", "unknown"))
+            slide_id = str(item.get("slide_id", "unknown")).strip() or "unknown"
+            arcname = f"visualizations/{source_dir}/{slide_id}/{src.name}"
+            key = (str(src), arcname.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            tf.add(str(src), arcname=arcname)
 
 
 def main() -> int:
@@ -378,6 +655,26 @@ def main() -> int:
 
     print(f"[run_remote_vlm] Input local path: {dataset_path}")
 
+    metadata_csv_path: Path | None = None
+    metadata_rows: list[dict[str, Any]] = []
+    metadata_by_basename: dict[str, deque[int]] = {}
+    metadata_by_tail: dict[str, deque[int]] = {}
+    try:
+        metadata_csv_path = _resolve_metadata_csv(dataset_path, args.metadata_csv)
+        if metadata_csv_path is not None:
+            metadata_rows = _load_metadata_rows(metadata_csv_path)
+            metadata_by_basename, metadata_by_tail = _build_metadata_lookup(metadata_rows)
+            print(
+                f"[run_remote_vlm] Metadata CSV: {metadata_csv_path} "
+                f"(rows={len(metadata_rows)})"
+            )
+        else:
+            print("[run_remote_vlm] Metadata CSV: not found (continuing without patch metadata).")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[run_remote_vlm] ERROR loading metadata CSV: {exc}", file=sys.stderr)
+        traceback.print_exc()
+        return 1
+
     image_paths = find_images(dataset_path, max_images=args.max_images)
     print(f"[run_remote_vlm] Found {len(image_paths)} image(s).")
     if not image_paths:
@@ -413,14 +710,36 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_dir / "vlm_outputs.jsonl"
     csv_path = output_dir / "vlm_outputs.csv"
+    vlm_metadata_path = output_dir / "vlm_metadata.csv"
+    visualizations_tar_path = output_dir / "visualizations.tar.gz"
 
     rows: list[dict] = []
+    vlm_metadata_rows: list[dict[str, Any]] = []
+    visualization_items: list[dict[str, Any]] = []
     n_valid_json = 0
+    metadata_matched = 0
 
     with jsonl_path.open("w", encoding="utf-8") as jfout:
         for idx, img_path in enumerate(image_paths):
             image_id = img_path.stem
             print(f"[run_remote_vlm] [{idx + 1}/{len(image_paths)}] {img_path}")
+
+            matched_metadata: dict[str, Any] | None = None
+            if metadata_rows:
+                matched_metadata = _match_metadata_row(
+                    img_path=img_path,
+                    dataset_path=dataset_path,
+                    metadata_rows=metadata_rows,
+                    by_basename=metadata_by_basename,
+                    by_tail=metadata_by_tail,
+                )
+                if matched_metadata is not None:
+                    metadata_matched += 1
+            metadata_record = _make_metadata_record(
+                img_path=img_path,
+                dataset_path=dataset_path,
+                metadata_row=matched_metadata,
+            )
 
             row: dict[str, Any] = {
                 "image_id": image_id,
@@ -432,6 +751,7 @@ def main() -> int:
             }
             # Pre-fill with normalized defaults so the row is always complete.
             row.update(normalize_json(None))
+            row.update(metadata_record)
 
             # Log the input image (best-effort).
             try:
@@ -474,6 +794,37 @@ def main() -> int:
             jfout.write(json.dumps(row, ensure_ascii=False) + "\n")
             jfout.flush()
 
+            export_row = {
+                "image_id": image_id,
+                "model_name": args.model_name,
+            }
+            export_row.update(copy.deepcopy(metadata_record))
+            for key in (
+                "json_valid",
+                "tissue_organ",
+                "tissue_description",
+                "cellularity",
+                "architecture",
+                "visible_abnormalities",
+                "tumor_suspicious",
+                "evidence",
+                "artifacts",
+                "limitations",
+                "visual_description_confidence",
+                "conclusion_confidence",
+                "should_abstain",
+                "error",
+            ):
+                export_row[key] = copy.deepcopy(row.get(key, ""))
+            vlm_metadata_rows.append(export_row)
+            visualization_items.append(
+                {
+                    "image_path": str(img_path),
+                    "source": metadata_record.get("source", ""),
+                    "slide_id": metadata_record.get("slide_id", ""),
+                }
+            )
+
             # Scalar progress logging.
             processed = idx + 1
             logger.report_scalar(
@@ -499,11 +850,21 @@ def main() -> int:
         for row in rows:
             writer.writerow({k: _csv_safe(row.get(k, "")) for k in OUTPUT_FIELDS})
 
+    _write_vlm_metadata_csv(vlm_metadata_path, vlm_metadata_rows)
+    _build_visualizations_tar(visualizations_tar_path, visualization_items)
+
     n_total = len(rows)
     valid_rate = (n_valid_json / n_total) if n_total else 0.0
     print(f"[run_remote_vlm] Wrote {jsonl_path}")
     print(f"[run_remote_vlm] Wrote {csv_path}")
+    print(f"[run_remote_vlm] Wrote {vlm_metadata_path}")
+    print(f"[run_remote_vlm] Wrote {visualizations_tar_path}")
     print(f"[run_remote_vlm] num_images={n_total} valid_json_rate={valid_rate:.3f}")
+    if metadata_rows:
+        print(
+            f"[run_remote_vlm] metadata matches: {metadata_matched}/{n_total} "
+            f"(metadata rows: {len(metadata_rows)})"
+        )
 
     # ------------------------------------------------------------------
     # 8. Final ClearML reporting + artifacts.
@@ -518,6 +879,8 @@ def main() -> int:
         try:
             task.upload_artifact(name="vlm_outputs_jsonl", artifact_object=str(jsonl_path))
             task.upload_artifact(name="vlm_outputs_csv", artifact_object=str(csv_path))
+            task.upload_artifact(name="vlm_metadata", artifact_object=str(vlm_metadata_path))
+            task.upload_artifact(name="visualizations", artifact_object=str(visualizations_tar_path))
         except Exception as exc:  # noqa: BLE001
             print(f"[run_remote_vlm] WARNING: artifact upload failed: {exc}")
 

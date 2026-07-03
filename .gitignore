@@ -231,6 +231,7 @@ clearml.conf
 data/he_test_10/
 data/wsi/
 data/quilt-1m
+data/vlm_patches_wsi_abmil/
 outputs/
 *.jsonl
 *.csv
@@ -263,3 +264,4 @@ checkpoints/
 !outputs/.gitkeep
 
 huly
+data/vlm_patches_wsi_abm
