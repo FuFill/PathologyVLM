@@ -647,7 +647,7 @@ def main() -> int:
                 dataset_project=args.dataset_project,
                 dataset_name=args.dataset_name,
             )
-            dataset_path = dataset.get_local_copy()
+            dataset_path = Path(dataset.get_local_copy())
         except Exception as exc:  # noqa: BLE001
             print(f"[run_remote_vlm] ERROR retrieving dataset: {exc}", file=sys.stderr)
             traceback.print_exc()
