@@ -665,3 +665,19 @@ python scripts/run_remote_vlm.py --run_remote --queue_name gpu --dataset_project
 > `$env:CLEARML_CONFIG_FILE = (Resolve-Path .\clearml.conf).Path` before
 > the commands above. Add `$env:PYTHONUNBUFFERED = "1"` to see live
 > upload progress.
+
+```
+python scripts\run_remote_vlm.py `
+  --run_remote `
+  --queue_name e0841e72c8a544efa9c54b5e768b1683 `
+  --project_name Pathology/VLM `
+  --task_name test_100_safe_v3 `
+  --dataset_project Pathology/VLM `
+  --dataset_name vlm_patches_wsi_abmil `
+  --metadata_csv vlm_patch_metadata.csv `
+  --prompt_variant safe `
+  --max_images 100 `
+  --max_new_tokens 768 `
+  --temperature 0.1 `
+  --output_dir outputs\test_100_safe_v3
+  ```
