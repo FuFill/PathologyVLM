@@ -54,28 +54,26 @@ Return JSON with exactly these fields, in this order:
 
 STANDARD_PROMPT = _BASE_RULES
 
-SAFE_PROMPT = """You are a pathology image assistant analyzing an H&E histology tile.
-Anatomical Context: Known Lymph Node tissue biopsy section.
+SAFE_PROMPT = """You are a pathology image assistant analyzing an H&E histology tile from a Lymph Node biopsy.
 
 Important rules:
-1. Do not provide a final clinical diagnosis name (e.g. adenocarcinoma, metastasis, lymphoma).
-2. Describe only morphological features clearly visible in this exact tile.
-3. Since this section is from a Lymph Node biopsy, set tissue_organ="lymph_node". Do not guess gastrointestinal/colon origins.
-4. If the image is blurry or heavily artifacted, set should_abstain=true.
-5. Inspect carefully for atypical foreign cell populations (e.g. pleomorphic epithelial nests, enlarged nucleoli, glandular crowding, or mitotic figures) disrupting lymphoid stroma.
-6. List all observed abnormalities in visible_abnormalities and evidence FIRST.
-7. If explicit morphological atypia is documented in evidence, set tumor_suspicious="yes". If the tile shows only normal preserved lymphocytes, set tumor_suspicious="no".
-8. Return ONLY a single JSON object.
+1. Do not provide a final diagnosis name. Describe visual morphology only.
+2. Set tissue_organ="lymph_node". Do not guess colon or GI origins.
+3. Classify the tile into exactly ONE of two morphological categories:
+   - Category A (Benign Lymphoid): Uniform lymphocytes, preserved follicular organization, absence of foreign epithelial nests or nuclear atypia. -> tumor_suspicious="no".
+   - Category B (Atypical / Infiltrating): Infiltrating foreign cells, severe nuclear pleomorphism, disrupted stroma, or frequent mitotic activity. -> tumor_suspicious="yes".
+4. In visible_abnormalities and evidence, write ONLY what you independently observe in the image. If normal lymphoid tissue is preserved, write "none".
+5. Return ONLY a single JSON object.
 
 Return JSON with exactly these fields, in this order:
 {
   "tissue_organ": "lymph_node",
   "cellularity": "<low | moderate | high>",
   "architecture": "<preserved | mildly distorted | severely distorted>",
-  "visible_abnormalities": ["<specific feature e.g. nuclear pleomorphism, enlarged hyperchromatic nuclei>", "..."],
-  "evidence": ["<concrete morphological feature justifying suspicion>", "..."],
+  "visible_abnormalities": ["<describe visible atypia independently, or write 'none'>"],
+  "evidence": ["<describe concrete visual evidence justifying your category, or write 'none'>"],
   "tumor_suspicious": "<yes | no | uncertain>",
-  "tissue_description": "<one concise synthesis sentence summarizing the observed features and any atypical infiltration>",
+  "tissue_description": "<one concise sentence summarizing the observed cells>",
   "artifacts": ["<blur | fold | none>"],
   "limitations": ["<short phrase>"],
   "visual_description_confidence": "<low | medium | high>",
