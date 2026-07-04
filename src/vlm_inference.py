@@ -92,6 +92,7 @@ def generate_answer(
     prompt: str,
     max_new_tokens: int,
     temperature: float,
+    repetition_penalty: float = 1.08,
 ) -> str:
     """Run inference on a single image and return the raw decoded text.
 
@@ -171,6 +172,7 @@ def generate_answer(
         "max_new_tokens": int(max_new_tokens),
         "use_cache": True,
         "stopping_criteria": [stopping_criteria],
+        "repetition_penalty": float(repetition_penalty),
     }
     if do_sample:
         gen_kwargs["temperature"] = float(temperature)

@@ -302,6 +302,12 @@ def _parse_args() -> argparse.Namespace:
         "--temperature", type=float, default=0.1, help="Sampling temperature."
     )
     parser.add_argument(
+        "--repetition_penalty",
+        type=float,
+        default=1.08,
+        help="Repetition penalty (>1.0 penalizes repeated tokens).",
+    )
+    parser.add_argument(
         "--load_4bit",
         action="store_true",
         help="Load model with bitsandbytes 4-bit quantization.",
@@ -842,6 +848,7 @@ def main() -> int:
                     prompt=get_prompt(args.prompt_variant),
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
+                    repetition_penalty=args.repetition_penalty,  # <-- ADD THIS LINE
                 )
                 row["raw_response"] = raw
 
