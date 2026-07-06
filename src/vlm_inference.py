@@ -48,8 +48,6 @@ def load_model(
     -------
     (tokenizer, model, image_processor, context_len)
     """
-    # Imported lazily so that ``import src.vlm_inference`` does not fail
-    # on machines that have not yet bootstrapped the ``llava`` package.
     from llava.mm_utils import get_model_name_from_path
     from llava.model.builder import load_pretrained_model
 
@@ -120,8 +118,6 @@ def generate_answer(
     image = safe_open_rgb(image_path)
 
     # --- Build the conversation prompt -----------------------------------
-    # Quilt-LLaVA / LLaVA-1.5-7b uses the "llava_v1" template (vicuna-style
-    # USER:/ASSISTANT: with the </s> stop token).
     conv = conv_templates["llava_v1"].copy()
 
     if getattr(model.config, "mm_use_im_start_end", False):
@@ -141,8 +137,6 @@ def generate_answer(
     full_prompt = conv.get_prompt()
 
     # --- Image tensor ----------------------------------------------------
-    # process_images honours model.config.image_aspect_ratio == 'pad'
-    # (which Quilt-LLaVA uses). Returns either a stacked tensor or a list.
     class _ImgCfg:
         image_aspect_ratio = getattr(model.config, "image_aspect_ratio", "pad")
 
@@ -165,6 +159,36 @@ def generate_answer(
     stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
     stopping_criteria = KeywordsStoppingCriteria([stop_str], tokenizer, input_ids)
 
+    # --- Safe Logits Processor for Repetition Penalty --------------------
+    # PyTorch/transformers built-in RepetitionPenaltyLogitsProcessor crashes with
+    # CUDA device-side assert when input_ids contains LLaVA's IMAGE_TOKEN_INDEX (-200).
+    # We construct a safe processor that clamps negative indices before gathering.
+    logits_processors = []
+    if repetition_penalty is not None and repetition_penalty > 1.0:
+        from transformers.generation.logits_process import LogitsProcessor
+
+        class _SafeRepetitionPenaltyLogitsProcessor(LogitsProcessor):
+            def __init__(self, penalty: float):
+                self.penalty = penalty
+
+            def __call__(
+                self, input_ids_tensor: torch.LongTensor, scores: torch.FloatTensor
+            ) -> torch.FloatTensor:
+                safe_ids = input_ids_tensor.clone()
+                safe_ids[safe_ids < 0] = (
+                    0  # Replace negative placeholder (-200) with safe pad index 0
+                )
+                score = torch.gather(scores, 1, safe_ids)
+                score = torch.where(
+                    score < 0, score * self.penalty, score / self.penalty
+                )
+                scores.scatter_(1, safe_ids, score)
+                return scores
+
+        logits_processors.append(
+            _SafeRepetitionPenaltyLogitsProcessor(float(repetition_penalty))
+        )
+
     do_sample = temperature is not None and temperature > 0.0
     gen_kwargs: dict = {
         "images": image_tensor,
@@ -172,8 +196,9 @@ def generate_answer(
         "max_new_tokens": int(max_new_tokens),
         "use_cache": True,
         "stopping_criteria": [stopping_criteria],
-        "repetition_penalty": float(repetition_penalty),
     }
+    if logits_processors:
+        gen_kwargs["logits_processor"] = logits_processors
     if do_sample:
         gen_kwargs["temperature"] = float(temperature)
         gen_kwargs["top_p"] = 0.95
@@ -181,9 +206,6 @@ def generate_answer(
     with torch.inference_mode():
         output_ids = model.generate(input_ids, **gen_kwargs)
 
-    # The upstream LLaVA model returns ONLY the new tokens (input is
-    # consumed by the multimodal projector pathway), so we decode from
-    # position 0. Defensive: if shape matches input length + new, slice.
     if output_ids.shape[1] >= input_ids.shape[1] and torch.equal(
         output_ids[:, : input_ids.shape[1]].cpu(), input_ids.cpu()
     ):
@@ -196,7 +218,6 @@ def generate_answer(
     # Re-attach the prefilled opening brace
     decoded = "{" + decoded.strip()
 
-    # Strip the stop string if the model emitted it.
     if stop_str and decoded.endswith(stop_str):
         decoded = decoded[: -len(stop_str)]
 

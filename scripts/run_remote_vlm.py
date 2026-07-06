@@ -23,15 +23,12 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
 
-# Make the local 'src' package importable when the script is launched from
-# the project root.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.prompt_templates import get_prompt
 
-# Columns in the output CSV / JSONL. Keep stable for downstream consumers.
 OUTPUT_FIELDS = [
     "image_id",
     "image_path",
@@ -73,9 +70,6 @@ OUTPUT_FIELDS = [
     "error",
 ]
 
-
-# Pinned Quilt-LLaVA git ref. We install at runtime with --no-deps to avoid
-# its setup.py downgrading torch/transformers from our requirements.txt.
 QUILT_LLAVA_GIT = (
     "git+https://github.com/aldraus/quilt-llava"
     "@7e70fc39f792ac55de010eb37bff0a6d6f491c13"
@@ -83,33 +77,6 @@ QUILT_LLAVA_GIT = (
 
 
 def _free_transformers_llava_slot() -> None:
-    """Unregister HF transformers' built-in ``llava`` config so the upstream
-    Quilt-LLaVA package can claim the same ``model_type`` key.
-
-    Background
-    ----------
-    HF transformers >= 4.36 ships a ``LlavaForConditionalGeneration`` whose
-    ``model_type`` is ``"llava"``. The upstream Quilt-LLaVA / LLaVA-1.5
-    package contains, at import time:
-
-        AutoConfig.register("llava", LlavaConfig)
-
-    Without intervention, importing ``llava`` raises:
-
-        ValueError: 'llava' is already used by a Transformers config,
-                    pick another name.
-
-    We remove the entry from both ``CONFIG_MAPPING_NAMES`` (lazy lookup
-    table) and ``CONFIG_MAPPING._extra_content`` (set by previous
-    registrations) BEFORE importing ``llava``. The upstream
-    ``AutoConfig.register("llava", ...)`` then succeeds and points the
-    ``"llava"`` model_type at ``LlavaLlamaForCausalLM`` (Llama-derived,
-    matches the wisdomik/Quilt-Llava-v1.5-7b checkpoint).
-
-    The official ``LlavaForConditionalGeneration`` is incompatible with
-    that checkpoint anyway (different state-dict key naming), so we lose
-    nothing by reclaiming the slot.
-    """
     try:
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING,
@@ -121,7 +88,6 @@ def _free_transformers_llava_slot() -> None:
             f"mappings to free 'llava' slot: {exc}"
         )
         return
-
     removed_names = CONFIG_MAPPING_NAMES.pop("llava", None)
     extra = getattr(CONFIG_MAPPING, "_extra_content", {})
     removed_extra = extra.pop("llava", None) if isinstance(extra, dict) else None
@@ -132,36 +98,15 @@ def _free_transformers_llava_slot() -> None:
 
 
 def _stub_llava_mpt() -> None:
-    """Pre-insert a fake ``llava.model.language_model.llava_mpt`` module
-    so the real one (which imports ``_expand_mask`` from
-    ``transformers.models.bloom.modeling_bloom`` -- removed in transformers
-    >= 4.36) is never executed.
-
-    Our checkpoint ``wisdomik/Quilt-Llava-v1.5-7b`` is Llama-based; the
-    MPT branch of the upstream package is dead code for our path.
-    Builder selects Llama vs MPT via ``'mpt' in model_name.lower()``,
-    so as long as the model name does not contain 'mpt', the stubbed
-    ``LlavaMPTForCausalLM`` is never instantiated.
-
-    IMPORTANT: We must ONLY pre-stub the leaf ``llava_mpt`` module. If we
-    also pre-stub ``llava`` / ``llava.model`` / etc. with empty placeholder
-    modules, Python's import system will happily return them instead of
-    executing the real ``__init__.py`` files on disk, leaving the real
-    package un-initialised (no ``LlavaLlamaForCausalLM``, no builder...).
-    """
     import sys
     import types
 
     mpt_stub = types.ModuleType("llava.model.language_model.llava_mpt")
 
     class _LlavaMPTConfig:  # noqa: D401, WPS431
-        """Stub - real MPT path disabled (transformers>=4.36 incompatibility)."""
-
         model_type = "llava_mpt_stub"
 
     class _LlavaMPTForCausalLM:  # noqa: D401, WPS431
-        """Stub - real MPT path disabled (transformers>=4.36 incompatibility)."""
-
         def __init__(self, *args, **kwargs):
             raise RuntimeError(
                 "LlavaMPTForCausalLM is stubbed out in this environment "
@@ -175,23 +120,6 @@ def _stub_llava_mpt() -> None:
 
 
 def _bootstrap_llava() -> None:
-    """Ensure the upstream ``llava`` package is importable.
-
-    Quilt-LLaVA's setup.py pins ``torch==2.0.1`` and ``transformers==4.31``,
-    which would clobber our requirements.txt stack. We therefore install
-    it with ``--no-deps`` only if it is not already present.
-
-    Before importing we also:
-      * free the transformers ``llava`` config slot (otherwise
-        ``AutoConfig.register('llava', ...)`` blows up);
-      * stub the MPT submodule (otherwise it tries to import
-        ``_expand_mask`` from transformers.models.bloom, which was
-        removed in transformers>=4.36).
-    """
-    # Install first (if missing). We do this BEFORE pre-stubbing so that
-    # the parent ``llava`` package on disk has the chance to register
-    # itself normally; the stubs in sys.modules only intercept the
-    # specific incompatible submodule.
     try:
         import importlib
 
@@ -219,8 +147,6 @@ def _bootstrap_llava() -> None:
             print(res.stderr, file=sys.stderr)
             raise RuntimeError(f"pip install of llava failed (exit {res.returncode})")
 
-    # Make sure any half-imported ``llava`` modules from a prior failed
-    # import attempt are evicted; then apply patches and import fresh.
     import sys as _sys
 
     for key in list(_sys.modules):
@@ -299,13 +225,10 @@ def _parse_args() -> argparse.Namespace:
         "--max_new_tokens", type=int, default=768, help="Generation length limit."
     )
     parser.add_argument(
-        "--temperature", type=float, default=0.1, help="Sampling temperature."
+        "--temperature", type=float, default=0.4, help="Sampling temperature."
     )
     parser.add_argument(
-        "--repetition_penalty",
-        type=float,
-        default=1.08,
-        help="Repetition penalty (>1.0 penalizes repeated tokens).",
+        "--repetition_penalty", type=float, default=1.08, help="Repetition penalty."
     )
     parser.add_argument(
         "--load_4bit",
@@ -321,7 +244,6 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _csv_safe(value: Any) -> Any:
-    """Make list/dict values CSV-safe by JSON-encoding them."""
     if isinstance(value, (list, dict)):
         return json.dumps(value, ensure_ascii=False)
     if value is None:
@@ -402,6 +324,7 @@ def _resolve_metadata_csv(dataset_path: Path, metadata_csv_arg: str) -> Path | N
         raise RuntimeError(
             "Multiple CSV files found in dataset; pass --metadata_csv explicitly."
         )
+
     return None
 
 
@@ -602,9 +525,6 @@ def main() -> int:
         def report_single_value(self, *args, **kwargs):
             return None
 
-    # ------------------------------------------------------------------
-    # 1. ClearML task init (must happen as early as possible).
-    # ------------------------------------------------------------------
     if args.run_remote and args.image_dir:
         print(
             "[run_remote_vlm] ERROR: --image_dir cannot be combined with --run_remote. "
@@ -631,22 +551,11 @@ def main() -> int:
             project_name=args.project_name,
             task_name=args.task_name,
             reuse_last_task_id=False,
-            # Disable the agent's default S3 output_uri inheritance. The remote
-            # clearml.conf on this server points sdk.development.default_output_uri
-            # at an s3:// bucket whose driver (boto3) is not installed, which
-            # makes Task.init() raise "Could not get access credentials". We do
-            # not need remote artifact storage for this run -- artifacts will be
-            # served by the ClearML files server.
             output_uri=False,
         )
         task.connect(vars(args))
         logger = task.get_logger()
 
-        # Pin the remote Python environment to our repo's requirements.txt
-        # instead of letting ClearML auto-freeze the local (Windows) venv,
-        # which would otherwise produce an incompatible stack on the agent
-        # (e.g. transformers==5.x, torch==2.12, pillow==12.2 which do not work
-        # with wisdomik/Quilt-Llava-v1.5-7b).
         try:
             req_path = PROJECT_ROOT / "requirements.txt"
             if req_path.is_file():
@@ -659,23 +568,10 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"[run_remote_vlm] WARNING: could not set packages: {exc}")
 
-    # ------------------------------------------------------------------
-    # 2. If requested, switch to remote execution and exit locally.
-    # ------------------------------------------------------------------
     if args.run_remote:
         print(f"[run_remote_vlm] Dispatching task to queue: {args.queue_name!r}")
         task.execute_remotely(queue_name=args.queue_name, exit_process=True)
-        # execute_remotely exits the process; nothing below runs locally.
 
-    # ------------------------------------------------------------------
-    # 3. Heavy imports (only done where the code actually runs - locally
-    #    or on the remote agent).
-    #
-    # Before importing src.vlm_inference (which imports `llava`), make
-    # sure the upstream Quilt-LLaVA package is installed. We install with
-    # --no-deps so its pinned torch==2.0.1 / transformers==4.31 do NOT
-    # downgrade the rest of our stack from requirements.txt.
-    # ------------------------------------------------------------------
     try:
         _bootstrap_llava()
     except Exception as exc:  # noqa: BLE001
@@ -694,9 +590,6 @@ def main() -> int:
         traceback.print_exc()
         return 2
 
-    # ------------------------------------------------------------------
-    # 4. Resolve inputs to a local path.
-    # ------------------------------------------------------------------
     if args.image_dir:
         dataset_path = Path(args.image_dir)
         print(f"[run_remote_vlm] Using local image directory: {dataset_path}")
@@ -748,7 +641,6 @@ def main() -> int:
         print("[run_remote_vlm] ERROR: no images found in dataset.", file=sys.stderr)
         return 1
 
-    # Environment info.
     cuda_available = torch.cuda.is_available()
     gpu_name = torch.cuda.get_device_name(0) if cuda_available else None
     print(f"[run_remote_vlm] CUDA available: {cuda_available}")
@@ -757,9 +649,6 @@ def main() -> int:
     print(f"[run_remote_vlm] Model: {args.model_name}")
     print(f"[run_remote_vlm] Prompt variant: {args.prompt_variant}")
 
-    # ------------------------------------------------------------------
-    # 5. Load model.
-    # ------------------------------------------------------------------
     try:
         tokenizer, model, image_processor, context_len = load_model(
             args.model_name, load_4bit=bool(args.load_4bit)
@@ -773,11 +662,9 @@ def main() -> int:
         traceback.print_exc()
         return 1
 
-    # ------------------------------------------------------------------
-    # 6. Inference loop.
-    # ------------------------------------------------------------------
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
     jsonl_path = output_dir / "vlm_outputs.jsonl"
     csv_path = output_dir / "vlm_outputs.csv"
     vlm_metadata_path = output_dir / "vlm_metadata.csv"
@@ -786,6 +673,7 @@ def main() -> int:
     rows: list[dict] = []
     vlm_metadata_rows: list[dict[str, Any]] = []
     visualization_items: list[dict[str, Any]] = []
+
     n_valid_json = 0
     metadata_matched = 0
 
@@ -819,11 +707,10 @@ def main() -> int:
                 "json_valid": False,
                 "error": "",
             }
-            # Pre-fill with normalized defaults so the row is always complete.
+
             row.update(normalize_json(None))
             row.update(metadata_record)
 
-            # Log the input image (best-effort).
             try:
                 from PIL import Image as _PILImage
 
@@ -848,7 +735,7 @@ def main() -> int:
                     prompt=get_prompt(args.prompt_variant),
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
-                    repetition_penalty=args.repetition_penalty,  # <-- ADD THIS LINE
+                    repetition_penalty=args.repetition_penalty,
                 )
                 row["raw_response"] = raw
 
@@ -872,6 +759,7 @@ def main() -> int:
                 "model_name": args.model_name,
             }
             export_row.update(copy.deepcopy(metadata_record))
+
             for key in (
                 "json_valid",
                 "tissue_organ",
@@ -889,6 +777,7 @@ def main() -> int:
                 "error",
             ):
                 export_row[key] = copy.deepcopy(row.get(key, ""))
+
             vlm_metadata_rows.append(export_row)
             visualization_items.append(
                 {
@@ -898,7 +787,6 @@ def main() -> int:
                 }
             )
 
-            # Scalar progress logging.
             processed = idx + 1
             logger.report_scalar(
                 title="progress",
@@ -906,6 +794,7 @@ def main() -> int:
                 value=processed,
                 iteration=processed,
             )
+
             valid_rate = n_valid_json / processed
             logger.report_scalar(
                 title="quality",
@@ -914,9 +803,6 @@ def main() -> int:
                 iteration=processed,
             )
 
-    # ------------------------------------------------------------------
-    # 7. Save CSV.
-    # ------------------------------------------------------------------
     with csv_path.open("w", encoding="utf-8", newline="") as cfout:
         writer = csv.DictWriter(cfout, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
         writer.writeheader()
@@ -933,15 +819,13 @@ def main() -> int:
     print(f"[run_remote_vlm] Wrote {vlm_metadata_path}")
     print(f"[run_remote_vlm] Wrote {visualizations_tar_path}")
     print(f"[run_remote_vlm] num_images={n_total} valid_json_rate={valid_rate:.3f}")
+
     if metadata_rows:
         print(
             f"[run_remote_vlm] metadata matches: {metadata_matched}/{n_total} "
             f"(metadata rows: {len(metadata_rows)})"
         )
 
-    # ------------------------------------------------------------------
-    # 8. Final ClearML reporting + artifacts.
-    # ------------------------------------------------------------------
     if task is not None:
         try:
             logger.report_single_value(name="num_images", value=n_total)
