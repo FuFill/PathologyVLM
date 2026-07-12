@@ -1,0 +1,62 @@
+# c16_best_safe.yaml
+#
+# The "best run" config for Quilt-LLaVA on the CAMELYON16 stratified subset.
+#
+# This reproduces the run that discriminated tumor vs non-tumor tiles: the
+# `safe` prompt at temperature 0.4 / repetition_penalty 1.08. On the 100-patch
+# smoke it gave tumor_suspicious yes/no/unc = 49/50/1, 99% JSON valid, 96/100
+# unique raw responses. It over-calls malignancy on some benign tissue (~48% FP
+# on oracle_non_tumor) but it DOES call tumors.
+#
+# NOT the `grounded` variant: grounded (temp 0.2, evidence-gated) over-corrected
+# to a degenerate "always no" — 0 tumor calls across all 100 patches, including
+# every ground-truth oracle_tumor tile. Do not use grounded for the full run.
+#
+# This file is documentation of the exact parameters. The scripts are driven by
+# CLI args, not by YAML (see CLAUDE.md); the canonical invocation is under
+# `command:` below. Keep this in sync with that command.
+
+project_name: Pathology/VLM
+task_name: c16_best_safe_full_424
+
+# ClearML GPU agent + input dataset (the agent cannot see local disk).
+queue_name: d33b6fa94d02482c818d4e0d45ae31cb
+dataset_project: Pathology/VLM
+dataset_name: c16_stratified_subset   # 424 patches (full subset)
+
+model_name: wisdomik/Quilt-Llava-v1.5-7b
+
+# --- The parameters that made this the good run ---
+prompt_variant: safe                  # safe_v4_neutral_contrastive
+temperature: 0.4                      # NOT 0.2 (grounded over-corrected at 0.2)
+repetition_penalty: 1.08
+max_new_tokens: 768
+top_p: 0.95
+load_4bit: true
+
+# Full run: no cap. The 100-patch smoke used max_images: 100.
+max_images: 0                         # 0 / omit = all 424 patches
+
+output_dir: outputs/c16_best_safe_full
+
+# Canonical invocation (CLI args are authoritative, this YAML is documentation):
+#
+#   export CLEARML_CONFIG_FILE=./clearml.conf
+#   python scripts/run_remote_vlm.py --run_remote \
+#     --queue_name d33b6fa94d02482c818d4e0d45ae31cb \
+#     --dataset_project Pathology/VLM --dataset_name c16_stratified_subset \
+#     --prompt_variant safe --temperature 0.4 --repetition_penalty 1.08 \
+#     --max_new_tokens 768 --load_4bit \
+#     --output_dir outputs/c16_best_safe_full \
+#     --task_name c16_best_safe_full_424
+#
+# Per-patch outputs (vlm_outputs.jsonl) already carry, for every patch:
+#   metadata (source/label/tile_in_mask/slide_id/x/y/attention_*), raw_response,
+#   parse_valid, json_valid, all parsed schema fields, tumor_suspicious,
+#   should_abstain, and the confidence fields (conclusion_confidence,
+#   visual_description_confidence, confidence).
+#
+# Grouped report (not one aggregate number) — table by source/label/tile_in_mask
+# with n, JSON valid, parse_valid, unique_raw, tumor yes/no/uncertain, abstain %:
+#
+#   python scripts/report_c16_groups.py outputs/c16_best_safe_full/vlm_outputs.jsonl
