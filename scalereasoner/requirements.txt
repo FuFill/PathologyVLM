@@ -10,3 +10,7 @@ pillow>=10.0.0
 # `--backend vllm`. Comment out if you only use the HF backend.
 vllm>=0.6.6
 openai>=1.40.0
+
+# ClearML: only needed to self-dispatch a describe run to a remote GPU agent
+# (`--run_remote`) or to read the tile set from a ClearML Dataset.
+clearml>=1.16.0

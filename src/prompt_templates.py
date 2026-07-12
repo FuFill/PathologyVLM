@@ -57,14 +57,42 @@ STANDARD_PROMPT = _BASE_RULES
 
 SAFE_PROMPT = _BASE_RULES
 
+# Grounded variant: keeps every rule of _BASE_RULES verbatim and APPENDS
+# evidence-gating + confidence-calibration constraints. This is a *tightening*
+# of the safety prompt, not a weakening — it forces the model to only report
+# features it can point to in the tile and to abstain / hedge when the evidence
+# is thin, targeting the observed failure mode (confident malignancy calls with
+# fabricated evidence on benign lymphoid tissue).
+_GROUNDING_RULES = """
+
+ADDITIONAL GROUNDING RULES (override any impulse to speculate):
+6. Evidence-gating: every item in "visible_abnormalities" MUST correspond to a
+   concrete feature you can point to in THIS tile, listed in "evidence". If you
+   cannot name the specific feature you see, do NOT list the abnormality —
+   write "none". Never invent findings (e.g. "mitotic activity", "pleomorphism")
+   that you cannot visually localize in this tile.
+7. Confidence calibration:
+   - "high" ONLY when the features you name are unambiguous and present across
+     the tile.
+   - "medium" when features are suggestive but partial or focal.
+   - "low" when the tile is bland, ambiguous, or evidence is thin. When in
+     doubt, choose "low" — do not default to "high".
+8. If the tile does not clearly fit Regime A or Regime B, set
+   tumor_suspicious="uncertain" AND should_abstain=true. Abstaining on an
+   ambiguous tile is correct behavior, not a failure. Do NOT guess "yes"."""
+
+GROUNDED_PROMPT = _BASE_RULES + _GROUNDING_RULES
+
 PROMPTS = {
     "standard": STANDARD_PROMPT,
     "safe": SAFE_PROMPT,
+    "grounded": GROUNDED_PROMPT,
 }
 
 PROMPT_VERSIONS = {
     "standard": "standard_v4_neutral_contrastive",
     "safe": "safe_v4_neutral_contrastive",
+    "grounded": "grounded_v5_evidence_gated",
 }
 
 

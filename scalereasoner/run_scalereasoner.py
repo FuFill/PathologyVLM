@@ -47,6 +47,22 @@ SYSTEM_PROMPT = (
     "Do not include the option text or any extra words inside <answer> </answer> tags."
 )
 
+# OFF-CONTRACT describe prompt. This is NOT part of ScaleReasoner-R1's trained
+# multiple-choice contract — the model was GRPO-trained to answer 3-image MCQs,
+# not to free-text-describe a single tile. It is used ONLY to obtain a
+# qualitative microdescription for side-by-side viewing against Quilt-LLaVA.
+# No performance comparison is drawn from this mode. Mirrors the Quilt-LLaVA
+# safety stance: describe visual morphology only, never a clinical diagnosis.
+DESCRIBE_SYSTEM_PROMPT = (
+    "You are a pathology image assistant analyzing a single H&E histology tile "
+    "from a lymph node. Describe ONLY the visual morphology you observe: tissue "
+    "architecture, cellularity, cell populations, and any abnormalities. Do NOT "
+    "give a clinical diagnosis or a disease name. Report only features you can "
+    "actually see in this tile; if the tissue looks unremarkable, say so. Keep "
+    "it to a few concise sentences."
+)
+DESCRIBE_USER_PROMPT = "Describe the visual morphology of this histology tile."
+
 MODEL_ID = "ChiPhan1110/ScaleReasoner-R1"
 MAG_KEYS = ("low_mag", "mid_mag", "high_mag")
 
@@ -137,6 +153,64 @@ def run_hf(mcqs: list[dict[str, Any]], image_root: Path, max_new_tokens: int) ->
     return results
 
 
+def run_describe_hf(
+    image_paths: list[Path], max_new_tokens: int
+) -> list[dict[str, Any]]:
+    """OFF-CONTRACT single-image free-text description via HF Transformers.
+
+    Loads ScaleReasoner-R1 and asks it to describe one tile at a time using
+    DESCRIBE_SYSTEM_PROMPT. This is NOT the model's trained MCQ task; output is
+    qualitative only. Row keys mirror Quilt-LLaVA (`image_id`/`patch_id` = file
+    stem) so scripts/report_model_compare.py can join the two model outputs.
+    """
+    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+    from qwen_vl_utils import process_vision_info
+
+    print(f"[scalereasoner] (describe) Loading {MODEL_ID} via Transformers ...")
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        MODEL_ID, torch_dtype="auto", device_map="auto"
+    )
+    processor = AutoProcessor.from_pretrained(MODEL_ID)
+
+    results: list[dict[str, Any]] = []
+    for i, img_path in enumerate(image_paths):
+        messages = [
+            {"role": "system", "content": DESCRIBE_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": str(img_path)},
+                    {"type": "text", "text": DESCRIBE_USER_PROMPT},
+                ],
+            },
+        ]
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        image_inputs, _ = process_vision_info(messages)
+        inputs = processor(
+            text=[text], images=image_inputs, return_tensors="pt"
+        ).to(model.device)
+        output = model.generate(**inputs, max_new_tokens=max_new_tokens)
+        decoded = processor.decode(
+            output[0][len(inputs.input_ids[0]):], skip_special_tokens=True
+        )
+        stem = img_path.stem
+        results.append(
+            {
+                "index": i,
+                "image_id": stem,
+                "patch_id": stem,
+                "image_path": str(img_path),
+                "raw": decoded,
+                "description": decoded.strip(),
+            }
+        )
+        print(f"[scalereasoner] (describe) {i + 1}/{len(image_paths)} -> {stem} "
+              f"({len(decoded.strip())} chars)")
+    return results
+
+
 def run_vllm(
     mcqs: list[dict[str, Any]], image_root: Path, max_new_tokens: int, base_url: str
 ) -> list[dict[str, Any]]:
@@ -172,19 +246,125 @@ def run_vllm(
     return results
 
 
+def _describe_main(args: argparse.Namespace) -> int:
+    """OFF-CONTRACT describe mode: free-text morphology on single tiles.
+
+    Input is a folder (``--image_root`` / ``--image_dir``) or, under
+    ``--run_remote``, a ClearML Dataset resolved on the agent. Only the HF
+    backend is supported here (single-image, no MCQ). Output rows join to
+    Quilt-LLaVA outputs by ``patch_id`` (file stem).
+    """
+    # Path (or ClearML-resolved dir) of images to describe.
+    if args.run_remote or args.dataset_name:
+        try:
+            from clearml import Dataset
+        except ImportError as exc:
+            print(f"[scalereasoner] ERROR: clearml not installed: {exc}", file=sys.stderr)
+            return 2
+        print(f"[scalereasoner] Retrieving ClearML dataset: "
+              f"project={args.dataset_project!r} name={args.dataset_name!r}")
+        image_dir = Path(
+            Dataset.get(
+                dataset_project=args.dataset_project, dataset_name=args.dataset_name
+            ).get_local_copy()
+        )
+    else:
+        image_dir = Path(args.image_dir or args.image_root)
+
+    # find_images lives in the repo's src/; add repo root to path when running
+    # from the agent checkout.
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from src.image_utils import find_images
+
+    image_paths = find_images(image_dir, args.max_images)
+    print(f"[scalereasoner] (describe) {len(image_paths)} images from {image_dir}")
+    if not image_paths:
+        print("[scalereasoner] ERROR: no images found.", file=sys.stderr)
+        return 1
+
+    results = run_describe_hf(image_paths, args.max_new_tokens)
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as fout:
+        for r in results:
+            fout.write(json.dumps(r, ensure_ascii=False) + "\n")
+    n = len(results)
+    non_empty = sum(1 for r in results if r["description"])
+    print(f"[scalereasoner] wrote {out_path}")
+    print(f"[scalereasoner] {n} tiles, {non_empty} non-empty descriptions "
+          f"({non_empty / n:.0%})")
+
+    task = getattr(args, "_clearml_task", None)
+    if task is not None:
+        try:
+            task.upload_artifact("scalereasoner_describe_jsonl", artifact_object=str(out_path))
+            print("[scalereasoner] uploaded artifact scalereasoner_describe_jsonl")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[scalereasoner] WARNING: artifact upload failed: {exc}")
+    return 0
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Run ScaleReasoner-R1 on cross-scale MCQs.")
-    ap.add_argument("--input", required=True, help="JSONL of Scale-VQA-style MCQs.")
-    ap.add_argument("--image_root", default=".", help="Root dir for relative image paths.")
+    ap = argparse.ArgumentParser(description="Run ScaleReasoner-R1 (MCQ or off-contract describe).")
+    ap.add_argument("--mode", choices=("mcq", "describe"), default="mcq",
+                    help="mcq = trained 3-image multiple-choice contract; "
+                         "describe = OFF-CONTRACT single-tile free-text (qualitative only).")
+    ap.add_argument("--input", help="JSONL of Scale-VQA-style MCQs (mode=mcq).")
+    ap.add_argument("--image_root", default=".", help="Root dir for relative image paths (mcq).")
+    ap.add_argument("--image_dir", help="Folder of single images to describe (mode=describe, local).")
     ap.add_argument("--output", default="scalereasoner_outputs.jsonl", help="Output JSONL.")
     ap.add_argument("--backend", choices=("hf", "vllm"), default="hf")
     ap.add_argument("--base_url", default="http://localhost:8000/v1",
-                    help="vLLM OpenAI-compatible endpoint (backend=vllm).")
+                    help="vLLM OpenAI-compatible endpoint (backend=vllm, mode=mcq).")
     ap.add_argument("--max_new_tokens", type=int, default=4096)
     ap.add_argument("--max_images", type=int, default=100,
-                    help="Cap the number of MCQs (smoke test first, per project policy).")
+                    help="Cap the number of items (smoke test first, per project policy).")
+    # ClearML remote dispatch (mirrors scripts/run_remote_vlm.py).
+    ap.add_argument("--run_remote", action="store_true",
+                    help="Register a ClearML task and dispatch to --queue_name, then exit.")
+    ap.add_argument("--queue_name", default="default", help="ClearML queue for remote execution.")
+    ap.add_argument("--project_name", default="Pathology/VLM", help="ClearML project.")
+    ap.add_argument("--task_name", default="scalereasoner_describe", help="ClearML task name.")
+    ap.add_argument("--dataset_project", default="Pathology/VLM", help="ClearML dataset project.")
+    ap.add_argument("--dataset_name", help="ClearML dataset name (describe input on the agent).")
     args = ap.parse_args()
 
+    # --- Optional ClearML task init + remote dispatch --------------------
+    if args.run_remote or (args.dataset_name and args.mode == "describe"):
+        try:
+            from clearml import Task
+        except ImportError as exc:
+            print(f"[scalereasoner] ERROR: clearml not installed: {exc}", file=sys.stderr)
+            return 2
+        task = Task.init(
+            project_name=args.project_name,
+            task_name=args.task_name,
+            reuse_last_task_id=False,
+            output_uri=False,
+        )
+        task.connect(vars(args))
+        try:
+            req_path = Path(__file__).resolve().parent / "requirements.txt"
+            if req_path.is_file():
+                task.set_packages(str(req_path))
+                print(f"[scalereasoner] Pinned remote packages from: {req_path}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[scalereasoner] WARNING: could not set packages: {exc}")
+        if args.run_remote:
+            print(f"[scalereasoner] Dispatching task to queue: {args.queue_name!r}")
+            task.execute_remotely(queue_name=args.queue_name, exit_process=True)
+        args._clearml_task = task
+
+    if args.mode == "describe":
+        return _describe_main(args)
+
+    # --- MCQ mode (trained contract, unchanged) --------------------------
+    if not args.input:
+        print("[scalereasoner] ERROR: --input is required for mode=mcq.", file=sys.stderr)
+        return 1
     in_path = Path(args.input)
     if not in_path.is_file():
         print(f"[scalereasoner] ERROR: input not found: {in_path}", file=sys.stderr)
