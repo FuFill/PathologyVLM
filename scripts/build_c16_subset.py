@@ -47,9 +47,28 @@ def _stratum(row: dict[str, Any]) -> tuple[str, str, str]:
     return tuple(str(row.get(k, "")).strip() for k in STRATUM_KEYS)  # type: ignore[return-value]
 
 
+def _rel_tail(row: dict[str, Any]) -> Path:
+    """The image's real <folder>/<source>/<file>.png tail from patch_path.
+
+    IMPORTANT: the same patch_id can appear twice — once under the plain
+    export folder (e.g. ``test_001_tile_embeddings/``) and once under the
+    ``*_diverse`` folder — with different x/y/tile_in_mask. They are physically
+    different patches, so the dedup key must be the patch_path folder, NOT
+    ``slide_id/source/patch_id`` (which collides across the two).
+    """
+    parts = str(row["patch_path"]).replace("\\", "/").split("/")
+    return Path(*parts[-3:])
+
+
+def _is_diverse(row: dict[str, Any]) -> bool:
+    """True if the patch comes from a ``*_diverse`` export folder."""
+    parts = str(row["patch_path"]).replace("\\", "/").split("/")
+    return len(parts) >= 3 and parts[-3].endswith("_diverse")
+
+
 def _local_image_path(src_dir: Path, row: dict[str, Any]) -> Path:
-    """Reconstruct the local patch path: <slide_id>/<source>/<patch_id>.png."""
-    return src_dir / row["slide_id"] / row["source"] / f"{row['patch_id']}.png"
+    """Reconstruct the local patch path from the patch_path tail."""
+    return src_dir / _rel_tail(row)
 
 
 def _allocate(strata: dict[tuple, list], target_n: int, floor: int) -> dict[tuple, int]:
@@ -93,15 +112,16 @@ def main() -> int:
         rows = [r for r in reader]
 
     if not args.include_diverse:
-        rows = [r for r in rows if str(r.get("is_diverse_topk", "0")).strip() != "1"]
+        rows = [r for r in rows if not _is_diverse(r)]
 
     strata: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
         strata[_stratum(r)].append(r)
 
-    # Deterministic ordering within each stratum.
+    # Deterministic ordering within each stratum. patch_id is NOT unique, so
+    # sort by the full patch_path tail to keep selection stable.
     for key in strata:
-        strata[key].sort(key=lambda r: str(r.get("patch_id", "")))
+        strata[key].sort(key=lambda r: _rel_tail(r).as_posix())
 
     alloc = _allocate(strata, args.target_n, args.floor)
 
@@ -117,7 +137,7 @@ def main() -> int:
             if not src_img.is_file():
                 missing += 1
                 continue
-            rel = Path(row["slide_id"]) / row["source"] / f"{row['patch_id']}.png"
+            rel = _rel_tail(row)
             dst_img = out_dir / rel
             dst_img.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src_img, dst_img)
