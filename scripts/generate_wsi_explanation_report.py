@@ -29,6 +29,7 @@ def load_vlm_outputs(path: Path) -> list[dict[str, Any]]:
         with path.open("r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for r in reader:
+                # Parse list fields stored as JSON strings in CSV
                 for field in (
                     "visible_abnormalities",
                     "evidence",
@@ -45,6 +46,7 @@ def load_vlm_outputs(path: Path) -> list[dict[str, Any]]:
 
 
 def generate_slide_report(rows: list[dict[str, Any]], out_md: Path) -> None:
+    # Group by slide_id
     slides: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
         slide_id = str(r.get("slide_id", "unknown")).strip() or "unknown"
@@ -59,7 +61,6 @@ def generate_slide_report(rows: list[dict[str, Any]], out_md: Path) -> None:
 
         for slide_id in sorted(slides.keys()):
             patches = slides[slide_id]
-            patches.sort(key=lambda x: float(x.get("attention_rank", 999)))
 
             slide_label = patches[0].get("label", "N/A")
             slide_pred = patches[0].get("prediction", "N/A")
@@ -68,8 +69,15 @@ def generate_slide_report(rows: list[dict[str, Any]], out_md: Path) -> None:
             f.write(
                 f"* **MIL Baseline Prediction:** `{slide_pred}` (Ground Truth Label: `{slide_label}`)\n"
             )
-            f.write(f"* **Evaluated Attention Patches:** {len(patches)}\n\n")
+            f.write(f"* **Total Patches Evaluated:** {len(patches)}\n\n")
 
+            # Group patches by sampling source (top_k, oracle_tumor, etc.)
+            by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for p in patches:
+                src = str(p.get("source", "unknown")).strip() or "unknown"
+                by_source[src].append(p)
+
+            # Slide summary across all evaluated patches
             high_cell = sum(
                 1 for p in patches if str(p.get("cellularity")).lower() == "high"
             )
@@ -80,7 +88,7 @@ def generate_slide_report(rows: list[dict[str, Any]], out_md: Path) -> None:
                 1 for p in patches if str(p.get("tumor_suspicious")).lower() == "yes"
             )
 
-            f.write("### Slide-Level Morphological Summary\n")
+            f.write("### Slide-Level Morphological Summary (All Patches)\n")
             f.write(f"* **High Cellularity Patches:** {high_cell} / {len(patches)}\n")
             f.write(
                 f"* **Architectural Distortion Patches:** {distorted} / {len(patches)}\n"
@@ -89,37 +97,70 @@ def generate_slide_report(rows: list[dict[str, Any]], out_md: Path) -> None:
                 f"* **VLM Tumor Suspicion Flags:** {suspicious} / {len(patches)}\n\n"
             )
 
-            f.write("### Top-k Patch Explainability Breakdown\n\n")
-            for idx, p in enumerate(patches[:10], start=1):
-                rank = p.get("attention_rank", idx)
-                score = p.get("attention_score", "N/A")
-                if isinstance(score, float):
-                    score = f"{score:.5f}"
+            # Focus the clinical report on the top_k MIL attention patches
+            report_sources = (
+                ["top_k"] if "top_k" in by_source else sorted(by_source.keys())
+            )
 
-                f.write(f"#### Patch Rank #{rank} (Attention Score: `{score}`)\n")
-                f.write(
-                    f"* **Tile ID / Path:** `{Path(str(p.get('image_path', ''))).name}`\n"
-                )
-                f.write(
-                    f"* **Microdescription:** {p.get('tissue_description', 'N/A')}\n"
-                )
-                f.write(
-                    f"* **Cellularity:** `{p.get('cellularity', 'N/A')}` | **Architecture:** `{p.get('architecture', 'N/A')}`\n"
+            for src in report_sources:
+                src_patches = by_source[src]
+                # Sort by attention rank ascending, or attention score descending
+                src_patches.sort(
+                    key=lambda x: (
+                        int(x.get("attention_rank", 999))
+                        if str(x.get("attention_rank", "")).isdigit()
+                        else 999,
+                        -float(x.get("attention_score", 0))
+                        if str(x.get("attention_score", ""))
+                        .replace(".", "-")
+                        .replace("e", "-")
+                        .isdigit()
+                        else 0,
+                    )
                 )
 
-                abnorms = p.get("visible_abnormalities", [])
-                if isinstance(abnorms, list) and abnorms:
+                f.write(
+                    f"### Section: `{src.upper()}` Patches (MIL Attention Selection)\n\n"
+                )
+
+                for idx, p in enumerate(src_patches[:10], start=1):
+                    rank = p.get("attention_rank", idx)
+                    score = p.get("attention_score", "N/A")
+                    if isinstance(score, float) or (
+                        isinstance(score, str)
+                        and score.replace(".", "").replace("e", "-").isdigit()
+                    ):
+                        try:
+                            score = f"{float(score):.6f}"
+                        except Exception:
+                            pass
+
+                    f.write(f"#### Rank #{rank} (Attention Score: `{score}`)\n")
                     f.write(
-                        f"* **Visible Abnormalities:** {', '.join(str(a) for a in abnorms)}\n"
+                        f"* **Tile ID / Path:** `{Path(str(p.get('image_path', ''))).name}`\n"
+                    )
+                    f.write(
+                        f"* **Microdescription:** {p.get('tissue_description', 'N/A')}\n"
+                    )
+                    f.write(
+                        f"* **Cellularity:** `{p.get('cellularity', 'N/A')}` | **Architecture:** `{p.get('architecture', 'N/A')}`\n"
                     )
 
-                ev = p.get("evidence", [])
-                if isinstance(ev, list) and ev:
-                    f.write(f"* **Visual Evidence:** {', '.join(str(e) for e in ev)}\n")
+                    abnorms = p.get("visible_abnormalities", [])
+                    if isinstance(abnorms, list) and abnorms:
+                        f.write(
+                            f"* **Visible Abnormalities:** {', '.join(str(a) for a in abnorms)}\n"
+                        )
 
-                f.write(
-                    f"* **Tumor Suspicious:** `{p.get('tumor_suspicious', 'uncertain')}` (Confidence: `{p.get('conclusion_confidence', 'low')}`)\n\n"
-                )
+                    ev = p.get("evidence", [])
+                    if isinstance(ev, list) and ev:
+                        f.write(
+                            f"* **Visual Evidence:** {', '.join(str(e) for e in ev)}\n"
+                        )
+
+                    f.write(
+                        f"* **Tumor Suspicious:** `{p.get('tumor_suspicious', 'uncertain')}` (Confidence: `{p.get('conclusion_confidence', 'low')}`)\n\n"
+                    )
 
             f.write("---\n\n")
 

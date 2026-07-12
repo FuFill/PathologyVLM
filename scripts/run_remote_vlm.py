@@ -27,14 +27,22 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.prompt_templates import get_prompt
+from src.prompt_templates import get_prompt, get_prompt_version
 
 OUTPUT_FIELDS = [
     "image_id",
     "image_path",
     "model_name",
+    "prompt_variant",
+    "prompt_version",
+    "schema_version",
+    "temperature",
+    "repetition_penalty",
+    "max_new_tokens",
+    "git_commit",
     "raw_response",
     "json_valid",
+    "parse_valid",
     "tissue_organ",
     "tissue_description",
     "cellularity",
@@ -241,6 +249,30 @@ def _parse_args() -> argparse.Namespace:
         help="If set, dispatch the task to the given ClearML queue and exit the local process.",
     )
     return parser.parse_args()
+
+
+def _git_commit() -> str:
+    """Return the current git commit hash, or '' if unavailable.
+
+    Recorded on every output row so a run can be traced back to the exact
+    code state (the ClearML task also records this, but embedding it in the
+    outputs makes downloaded artifacts self-describing).
+    """
+    import subprocess
+
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if res.returncode == 0:
+            return res.stdout.strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
 
 
 def _csv_safe(value: Any) -> Any:
@@ -457,7 +489,15 @@ def _write_vlm_metadata_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "x",
         "y",
         "model_name",
+        "prompt_variant",
+        "prompt_version",
+        "schema_version",
+        "temperature",
+        "repetition_penalty",
+        "max_new_tokens",
+        "git_commit",
         "json_valid",
+        "parse_valid",
         "tissue_organ",
         "tissue_description",
         "cellularity",
@@ -583,7 +623,7 @@ def main() -> int:
         import torch  # noqa: WPS433 (local import on purpose)
 
         from src.image_utils import find_images
-        from src.json_utils import extract_json, normalize_json
+        from src.json_utils import SCHEMA_VERSION, extract_json, normalize_json
         from src.vlm_inference import generate_answer, load_model
     except ImportError as exc:
         print(f"[run_remote_vlm] ERROR importing dependencies: {exc}", file=sys.stderr)
@@ -665,6 +705,22 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    git_commit = _git_commit()
+    prompt_version = get_prompt_version(args.prompt_variant)
+    provenance = {
+        "prompt_variant": args.prompt_variant,
+        "prompt_version": prompt_version,
+        "schema_version": SCHEMA_VERSION,
+        "temperature": args.temperature,
+        "repetition_penalty": args.repetition_penalty,
+        "max_new_tokens": args.max_new_tokens,
+        "git_commit": git_commit,
+    }
+    print(
+        f"[run_remote_vlm] Provenance: prompt_version={prompt_version} "
+        f"schema_version={SCHEMA_VERSION} git_commit={git_commit or '(unknown)'}"
+    )
+
     jsonl_path = output_dir / "vlm_outputs.jsonl"
     csv_path = output_dir / "vlm_outputs.csv"
     vlm_metadata_path = output_dir / "vlm_metadata.csv"
@@ -705,8 +761,10 @@ def main() -> int:
                 "model_name": args.model_name,
                 "raw_response": "",
                 "json_valid": False,
+                "parse_valid": False,
                 "error": "",
             }
+            row.update(provenance)
 
             row.update(normalize_json(None))
             row.update(metadata_record)
@@ -741,6 +799,7 @@ def main() -> int:
 
                 parsed = extract_json(raw)
                 row["json_valid"] = parsed is not None
+                row["parse_valid"] = parsed is not None
                 if parsed is not None:
                     n_valid_json += 1
                 row.update(normalize_json(parsed))
@@ -758,10 +817,12 @@ def main() -> int:
                 "image_id": image_id,
                 "model_name": args.model_name,
             }
+            export_row.update(provenance)
             export_row.update(copy.deepcopy(metadata_record))
 
             for key in (
                 "json_valid",
+                "parse_valid",
                 "tissue_organ",
                 "tissue_description",
                 "cellularity",

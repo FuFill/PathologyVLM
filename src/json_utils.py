@@ -12,8 +12,13 @@ import json
 import re
 from typing import Any, Optional
 
+# Version of the normalized output schema. Bump whenever the fields, their
+# names, or their allowed values change, so outputs remain traceable.
+SCHEMA_VERSION = "vlm_schema_v1"
+
 # Stable output schema. Keep in sync with the fixed prompt in run_remote_vlm.py.
 DEFAULT_SCHEMA: dict[str, Any] = {
+    "schema_version": SCHEMA_VERSION,
     "tissue_organ": "uncertain",
     "tissue_description": "",
     "cellularity": "",

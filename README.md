@@ -49,30 +49,73 @@ H&E patch / set of patches -> structured microdescription / explanation / uncert
 The prompt instructs the model to describe only visible morphological
 features and to set `should_abstain=true` when evidence is insufficient.
 
-## 4. Project structure
+## 4. Project structure and what each part does
 
 ```
-vlm-pathology-baseline/
+Medlab/
   README.md
+  CLAUDE.md                    # guidance for AI agents working in this repo
   requirements.txt
-  .gitignore
+  clearml.conf                 # ClearML creds (gitignored — never commit)
   configs/
     default.yaml
-  scripts/
+  src/                         # importable library code
+    json_utils.py
+    image_utils.py
+    vlm_inference.py
+    prompt_templates.py
+  scripts/                     # runnable entrypoints
     prepare_pathgen_subset.py
     upload_clearml_dataset.py
     run_remote_vlm.py
     inspect_dataset.py
-  src/
-    __init__.py
-    json_utils.py
-    image_utils.py
-    vlm_inference.py
-  data/
-    .gitkeep
-  outputs/
-    .gitkeep
+    build_c16_subset.py
+    report_c16_groups.py
+    build_quilt1m_report.py
+    generate_wsi_explanation_report.py
+  scalereasoner/               # standalone ScaleReasoner-R1 runner (separate task)
+    run_scalereasoner.py
+    requirements.txt
+    README.md
+  data/                        # datasets (gitignored)
+  outputs/                     # run outputs (gitignored)
 ```
+
+### `src/` — library modules
+
+| Module | Responsibility |
+|---|---|
+| `json_utils.py` | The **output schema contract**. Defines `DEFAULT_SCHEMA`, `SCHEMA_VERSION`, and the defensive parser/normalizer that turns noisy VLM text into a stable dict. `tissue_organ` supports `uncertain`; both `visual_description_confidence` and `conclusion_confidence` are always emitted. Every output row is built from this schema, so schema changes flow everywhere automatically. |
+| `vlm_inference.py` | Loads Quilt-LLaVA via the upstream `llava` loader (the HF checkpoint uses original-LLaVA class names) and runs single-image generation. Prefills the assistant turn with `{` to force JSON, and uses a CUDA-safe repetition-penalty processor that tolerates LLaVA's `IMAGE_TOKEN_INDEX (-200)`. |
+| `image_utils.py` | Safe RGB image opening used by inference. |
+| `prompt_templates.py` | The fixed prompts (`standard`, `safe`) and `get_prompt_version()`. The `safe` prompt forces `tissue_organ=lymph_node` — correct for CAMELYON16 (breast metastasis to lymph node); do not change it. |
+
+### `scripts/` — entrypoints
+
+| Script | Responsibility |
+|---|---|
+| `run_remote_vlm.py` | Main orchestrator. Runs the VLM locally or dispatches to a ClearML GPU agent, then writes `vlm_outputs.jsonl` / `.csv` / `vlm_metadata.csv`. Each row now carries **run provenance** — `prompt_version`, `schema_version`, `temperature`, `repetition_penalty`, `max_new_tokens`, `git_commit`, plus `parse_valid` / `json_valid` — so any ClearML run can be traced back to the exact code and settings. |
+| `build_c16_subset.py` | Builds a **stratified** subset of the 4656-patch CAMELYON16 ABMIL export, stratified by `(source, slide_label, tile_in_mask)` with deterministic (no-RNG) selection and a per-stratum floor so small clinically-important groups aren't starved. Copies images into a `slide_id/source/patch.png` layout + `subset_metadata.csv`. |
+| `report_c16_groups.py` | Builds a **grouped** evaluation table (not one aggregate number) from a run's `vlm_outputs.jsonl`: per `(source, label, tile_in_mask)` group it reports n, JSON-valid %, parse-valid %, `unique_raw` (distinct raw responses — flags mode collapse), tumor yes/no/uncertain, and abstain %. |
+| `upload_clearml_dataset.py` | Uploads a local folder as a ClearML Dataset so the remote agent can fetch it. |
+| `prepare_pathgen_subset.py` | Builds a PathGen-1.6M patch subset by joining the gated JSON metadata with TCGA slides fetched via `gdc-client`. |
+| `inspect_dataset.py` / `inspect_quilt_1m_image.py` | Sanity-check a dataset JSON / one image's model output. |
+| `build_quilt1m_report.py` / `generate_wsi_explanation_report.py` | Proxy-metric report for Quilt-1M outputs / per-slide WSI explanation report. |
+
+### `scalereasoner/` — separate model, separate task
+
+Standalone runner for **ScaleReasoner-R1**, a Qwen2.5-VL-7B cross-scale
+multi-image MCQ model. This is a **different task shape** from the
+Quilt-LLaVA single-patch JSON describer (3 magnifications + A–D options →
+`<think>/<answer>`), so it lives in its own folder with its own
+`requirements.txt`, and **no cross-model comparison** is made until both are
+run on identical inputs. See `scalereasoner/README.md`.
+
+### Reproducibility note
+
+Outputs are self-describing: every row records the git commit, prompt version,
+schema version, and generation parameters. To reproduce a ClearML result,
+check out the row's `git_commit` and re-run with the recorded params.
 
 ## 5. Installation
 
@@ -345,6 +388,41 @@ When `--run_remote` is set, the script registers the task with ClearML
 and immediately exits the local process. The agent then pulls the task,
 installs dependencies, and runs inference on the GPU. Do not combine
 `--run_remote` with `--image_dir`.
+
+## 9b. CAMELYON16 stratified baseline
+
+The `data/vlm_patches_wsi_abmil/` export has 4656 ABMIL patches. For a clean
+baseline, do **not** run all of them at once — build a stratified subset,
+run it, then report by group.
+
+**1. Build the subset** (deterministic, ~400 patches by default):
+
+```bash
+python scripts/build_c16_subset.py --target_n 400 --floor 20
+```
+
+This writes `data/c16_stratified_subset/` (images in `slide_id/source/` layout
++ `subset_metadata.csv`) and prints the realized per-group counts.
+
+**2. Upload it as a ClearML Dataset:**
+
+```bash
+python scripts/upload_clearml_dataset.py \
+  --dataset_project Pathology/VLM \
+  --dataset_name c16_stratified_subset \
+  --folder data/c16_stratified_subset
+```
+
+**3. Run the VLM** on the subset (smoke-test with `--max_images 100` first),
+then **4. build the grouped report:**
+
+```bash
+python scripts/report_c16_groups.py --input outputs/<run_dir>/vlm_outputs.jsonl
+```
+
+The report is intentionally **not** a single number. Watch `unique_raw` per
+group: if it is far below `n`, the model is repeating itself (mode collapse)
+rather than reading each patch — a failure a single aggregate would hide.
 
 ## 11. Inspect one image
 
@@ -669,15 +747,16 @@ python scripts/run_remote_vlm.py --run_remote --queue_name gpu --dataset_project
 ```
 python scripts\run_remote_vlm.py `
   --run_remote `
-  --queue_name e0841e72c8a544efa9c54b5e768b1683 `
+  --queue_name d33b6fa94d02482c818d4e0d45ae31cb `
   --project_name Pathology/VLM `
-  --task_name test_100_safe_v3 `
+  --task_name test_100_safe_v4_temp04 `
   --dataset_project Pathology/VLM `
   --dataset_name vlm_patches_wsi_abmil `
   --metadata_csv vlm_patch_metadata.csv `
   --prompt_variant safe `
   --max_images 100 `
   --max_new_tokens 768 `
-  --temperature 0.1 `
-  --output_dir outputs\test_100_safe_v3
+  --temperature 0.4 `
+  --repetition_penalty 1.08 `
+  --output_dir outputs\test_100_safe_v4_temp04
   ```

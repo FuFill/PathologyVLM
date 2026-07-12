@@ -1,0 +1,12 @@
+# Core multi-image VLM stack for ScaleReasoner-R1 (Qwen2.5-VL-7B backbone).
+# Pin to versions known to support Qwen2.5-VL. CUDA 12.1+ / PyTorch 2.3+ host.
+transformers>=4.49.0
+accelerate>=0.34.0
+qwen-vl-utils>=0.0.8
+torch>=2.3.0
+pillow>=10.0.0
+
+# vLLM backend (Option 1 in the model card). Optional: only needed for
+# `--backend vllm`. Comment out if you only use the HF backend.
+vllm>=0.6.6
+openai>=1.40.0
