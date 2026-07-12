@@ -347,7 +347,13 @@ def main() -> int:
         )
         task.connect(vars(args))
         try:
-            req_path = Path(__file__).resolve().parent / "requirements.txt"
+            # HF-only remote deps: the full requirements.txt pins vllm, which on
+            # a CUDA-12 agent pulls a conflicting CUDA-13 tree and fails pip
+            # install. The remote describe run uses the HF backend only.
+            req_dir = Path(__file__).resolve().parent
+            req_path = req_dir / "requirements-remote.txt"
+            if not req_path.is_file():
+                req_path = req_dir / "requirements.txt"
             if req_path.is_file():
                 task.set_packages(str(req_path))
                 print(f"[scalereasoner] Pinned remote packages from: {req_path}")

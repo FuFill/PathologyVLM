@@ -1,0 +1,11 @@
+# HF-only deps for a remote ClearML describe run (--mode describe --backend hf).
+# Deliberately EXCLUDES vllm/openai: on a CUDA-12 agent, vllm>=0.6.6 pulls a
+# CUDA-13 dependency tree (cuda-python 13.x vs cuda-bindings 12.x) that fails
+# to resolve and kills the task in pip-install. The describe path never needs
+# vllm. Use scalereasoner/requirements.txt locally if you want the vllm backend.
+transformers>=4.49.0
+accelerate>=0.34.0
+qwen-vl-utils>=0.0.8
+torch>=2.3.0
+pillow>=10.0.0
+clearml>=1.16.0
