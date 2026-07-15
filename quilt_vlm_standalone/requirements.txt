@@ -1,0 +1,27 @@
+# Quilt-LLaVA standalone runner — dependencies.
+#
+# Install (GPU, CUDA 12.x):
+#   pip install -r requirements.txt
+#
+# The `llava` package (Quilt-LLaVA fork) is INTENTIONALLY not listed here — its
+# setup.py pins torch==2.0.1 and would break this install. run.py installs it
+# automatically at runtime with `pip install --no-deps` (see model.py). You need
+# `git` on PATH for that step.
+#
+# torch/torchvision below are the CUDA 12.9 wheels used in production. If your
+# CUDA differs, install the matching torch build first, then the rest.
+
+--extra-index-url https://download.pytorch.org/whl/cu129
+torch==2.8.0
+torchvision==0.23.0
+transformers==4.37.2
+tokenizers==0.15.2
+accelerate==0.27.2
+safetensors==0.4.2
+sentencepiece==0.2.0
+protobuf==4.25.3
+bitsandbytes==0.46.1          # only needed for --load_4bit
+huggingface_hub==0.20.3
+pillow==10.3.0
+numpy==1.26.4
+einops==0.7.0

@@ -22,20 +22,20 @@ task_name: c16_best_safe_full_424
 # ClearML GPU agent + input dataset (the agent cannot see local disk).
 queue_name: d33b6fa94d02482c818d4e0d45ae31cb
 dataset_project: Pathology/VLM
-dataset_name: c16_stratified_subset   # 424 patches (full subset)
+dataset_name: c16_stratified_subset # 424 patches (full subset)
 
 model_name: wisdomik/Quilt-Llava-v1.5-7b
 
 # --- The parameters that made this the good run ---
-prompt_variant: safe                  # safe_v4_neutral_contrastive
-temperature: 0.4                      # NOT 0.2 (grounded over-corrected at 0.2)
+prompt_variant: safe # safe_v4_neutral_contrastive
+temperature: 0.4 # NOT 0.2 (grounded over-corrected at 0.2)
 repetition_penalty: 1.08
 max_new_tokens: 768
 top_p: 0.95
-load_4bit: true
+load_4bit: false
 
 # Full run: no cap. The 100-patch smoke used max_images: 100.
-max_images: 0                         # 0 / omit = all 424 patches
+max_images: 0 # 0 / omit = all 424 patches
 
 output_dir: outputs/c16_best_safe_full
 
