@@ -20,17 +20,38 @@ with the rest of our requirements).
 
 from __future__ import annotations
 
+import random
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
 from .image_utils import safe_open_rgb
 
 
+def set_seed(seed: int) -> None:
+    """Seed Python / NumPy / Torch RNGs for reproducible sampling.
+
+    Note: seeding makes a *sampled* (temperature>0) run repeatable given the
+    same model, inputs and kernels, but does NOT make temperature>0 behave like
+    greedy decoding. For a deterministic control run use temperature=0.
+    """
+    random.seed(seed)
+    try:
+        import numpy as np
+
+        np.random.seed(seed)
+    except Exception:  # noqa: BLE001 — numpy optional
+        pass
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def load_model(
     model_name: str,
     load_4bit: bool,
+    revision: Optional[str] = None,
 ):
     """Load a Quilt-LLaVA / LLaVA-1.5 model via the upstream loader.
 
@@ -91,6 +112,7 @@ def generate_answer(
     max_new_tokens: int,
     temperature: float,
     repetition_penalty: float = 1.08,
+    seed: Optional[int] = None,
 ) -> str:
     """Run inference on a single image and return the raw decoded text.
 
@@ -202,6 +224,11 @@ def generate_answer(
     if do_sample:
         gen_kwargs["temperature"] = float(temperature)
         gen_kwargs["top_p"] = 0.95
+
+    # Seed immediately before generate so a sampled run is repeatable per-image
+    # regardless of subset size / iteration order. No-op for greedy (temp==0).
+    if seed is not None:
+        set_seed(int(seed))
 
     with torch.inference_mode():
         output_ids = model.generate(input_ids, **gen_kwargs)

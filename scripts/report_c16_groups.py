@@ -30,6 +30,11 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.json_utils import parse_with_provenance  # noqa: E402
+
 DEFAULT_INPUT = PROJECT_ROOT / "outputs" / "abmil_standard_100" / "vlm_outputs.jsonl"
 DEFAULT_OUT_MD = PROJECT_ROOT / "outputs" / "c16_grouped_report.md"
 DEFAULT_OUT_CSV = PROJECT_ROOT / "outputs" / "c16_grouped_metrics.csv"
@@ -70,13 +75,27 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         1 for r in rows
         if _coerce_bool(r.get("parse_valid", r.get("json_valid")))
     )
+    # strict_json_valid / schema_valid: the raw response was valid JSON with NO
+    # repair / matched the schema. For runs that predate these flags we
+    # recompute them from raw_response so the report still shows the TRUE strict
+    # rate rather than a misleading 0.
+    def _flag(r: dict[str, Any], key: str) -> bool:
+        if key in r and r[key] is not None:
+            return _coerce_bool(r[key])
+        _, prov = parse_with_provenance(str(r.get("raw_response", "")))
+        return bool(prov[key])
+
+    strict_json_valid = sum(1 for r in rows if _flag(r, "strict_json_valid"))
+    schema_valid = sum(1 for r in rows if _flag(r, "schema_valid"))
     unique_raw = len({str(r.get("raw_response", "")) for r in rows})
     ts = Counter(str(r.get("tumor_suspicious", "")).strip().lower() or "uncertain" for r in rows)
     abstain = sum(1 for r in rows if _coerce_bool(r.get("should_abstain")))
     return {
         "n": n,
+        "strict_json_valid": strict_json_valid,
         "json_valid": json_valid,
         "parse_valid": parse_valid,
+        "schema_valid": schema_valid,
         "unique_raw": unique_raw,
         "ts_yes": ts.get("yes", 0),
         "ts_no": ts.get("no", 0),
@@ -101,8 +120,9 @@ def _summary_cells(label: str, s: dict[str, Any]) -> list[str]:
     return [
         label,
         str(s["n"]),
-        f"{s['json_valid']} ({_pct(s['json_valid'], s['n'])})",
+        f"{s['strict_json_valid']} ({_pct(s['strict_json_valid'], s['n'])})",
         f"{s['parse_valid']} ({_pct(s['parse_valid'], s['n'])})",
+        f"{s['schema_valid']} ({_pct(s['schema_valid'], s['n'])})",
         str(s["unique_raw"]),
         f"{s['ts_yes']}/{s['ts_no']}/{s['ts_uncertain']}",
         _pct(s["abstain"], s["n"]),
@@ -132,15 +152,16 @@ def main() -> int:
         groups[_group_key(r)].append(r)
         by_source[str(r.get("source", "")).strip()].append(r)
 
-    header = ["group (source/label/tile_in_mask)", "n", "json_valid",
-              "parse_valid", "unique_raw", "tumor yes/no/unc", "abstain"]
+    header = ["group (source/label/tile_in_mask)", "n", "strict_json",
+              "parse_valid", "schema_valid", "unique_raw", "tumor yes/no/unc",
+              "abstain"]
 
     group_body: list[list[str]] = []
     for key in sorted(groups.keys()):
         s = _summarize(groups[key])
         group_body.append(_summary_cells("/".join(key), s))
 
-    src_header = ["source", "n", "json_valid", "parse_valid",
+    src_header = ["source", "n", "strict_json", "parse_valid", "schema_valid",
                   "unique_raw", "tumor yes/no/unc", "abstain"]
     src_body: list[list[str]] = []
     for src in sorted(by_source.keys()):
@@ -157,6 +178,14 @@ def main() -> int:
               "If it is far below `n`, the model is repeating itself (mode "
               "collapse) rather than describing each patch.")
     md.append("")
+    md.append("`strict_json` = raw response parsed as JSON with NO repair; "
+              "`parse_valid` = a dict was recovered by any means (fence-strip, "
+              "`\\_` escape repair, or brace-salvage); `schema_valid` = the "
+              "parsed dict had every required field with in-range enums. A large "
+              "gap between `strict_json` and `parse_valid` means the reported "
+              "JSON rate depended on repair. (For runs predating these flags, "
+              "`strict_json`/`schema_valid` are recomputed from `raw_response`.)")
+    md.append("")
     md.append("## By group (source / label / tile_in_mask)")
     md.extend(_table(header, group_body))
     md.append("")
@@ -172,9 +201,9 @@ def main() -> int:
     out_md.parent.mkdir(parents=True, exist_ok=True)
     out_md.write_text("\n".join(md) + "\n", encoding="utf-8")
 
-    csv_fields = ["source", "label", "tile_in_mask", "n", "json_valid",
-                  "parse_valid", "unique_raw", "ts_yes", "ts_no",
-                  "ts_uncertain", "abstain"]
+    csv_fields = ["source", "label", "tile_in_mask", "n", "strict_json_valid",
+                  "json_valid", "parse_valid", "schema_valid", "unique_raw",
+                  "ts_yes", "ts_no", "ts_uncertain", "abstain"]
     with out_csv.open("w", encoding="utf-8", newline="") as fout:
         writer = csv.DictWriter(fout, fieldnames=csv_fields)
         writer.writeheader()
@@ -182,7 +211,8 @@ def main() -> int:
             s = _summarize(groups[key])
             writer.writerow({"source": key[0], "label": key[1],
                              "tile_in_mask": key[2], **{k: s[k] for k in
-                             ("n", "json_valid", "parse_valid", "unique_raw",
+                             ("n", "strict_json_valid", "json_valid",
+                              "parse_valid", "schema_valid", "unique_raw",
                               "ts_yes", "ts_no", "ts_uncertain", "abstain")}})
 
     print(f"[report_c16_groups] wrote {out_md}")

@@ -83,16 +83,61 @@ ADDITIONAL GROUNDING RULES (override any impulse to speculate):
 
 GROUNDED_PROMPT = _BASE_RULES + _GROUNDING_RULES
 
+# Neutral variant: written from scratch (does NOT reuse _BASE_RULES) to remove
+# the answer-leaking content the earlier prompts contained. The old Regime A/B
+# block pre-listed specific findings ("foreign epithelial nests", "nuclear
+# atypia", "frequent mitotic activity", "pleomorphism") and mapped each to a
+# tumor_suspicious answer, which the model then parroted back regardless of the
+# image. This variant names NO findings and forces NO benign-vs-atypical choice.
+# It keeps every safety rule (no diagnosis name, JSON-only, closed organ vocab)
+# and the exact same output schema/field order as the other variants so
+# normalize_json and OUTPUT_FIELDS stay in sync.
+NEUTRAL_PROMPT = """You are a pathology image assistant analyzing an H&E histology tile from a lymph node biopsy.
+
+Rules:
+1. Do not provide a clinical diagnosis name. Describe only the visual morphology you observe.
+2. Describe ONLY features you can independently see in THIS tile. Do not list findings you cannot point to in the image. If you observe no abnormality, leave the list empty ([]).
+3. You are NOT required to decide between "benign" and "malignant". If the tile is bland, ambiguous, or the evidence is insufficient, set tumor_suspicious="uncertain" and should_abstain=true. Abstaining is a valid, correct outcome.
+4. Set confidence honestly: "high" only when the features you name are unambiguous and span the tile; "medium" when suggestive but partial; "low" when the tile is bland or ambiguous. When in doubt choose "low".
+5. Return ONLY a single JSON object. No prose before or after. No markdown fences. No backslash escapes inside field names.
+
+tissue_organ must be exactly ONE of:
+  "lymph_node", "colon", "rectum", "lung", "breast", "kidney", "prostate", "brain",
+  "liver", "stomach", "pancreas", "skin", "bone_marrow", "soft_tissue", "other", "uncertain"
+
+tumor_suspicious must be exactly ONE of: "yes", "no", "uncertain".
+visual_description_confidence must be exactly ONE of: "low", "medium", "high".
+conclusion_confidence must be exactly ONE of: "low", "medium", "high".
+should_abstain must be a JSON boolean (true or false).
+
+Return JSON with exactly these fields, in this order:
+{
+  "tissue_organ": "<one value from the list above>",
+  "cellularity": "<low | moderate | high>",
+  "architecture": "<preserved | mildly distorted | severely distorted>",
+  "visible_abnormalities": ["<only what you independently observe, or leave empty>"],
+  "evidence": ["<concrete visual features you can point to in this tile, or leave empty>"],
+  "tumor_suspicious": "yes/no/uncertain",
+  "tissue_description": "<one concise sentence describing the observed features>",
+  "artifacts": ["<blur | fold | none>"],
+  "limitations": ["<short phrase>"],
+  "visual_description_confidence": "low/medium/high",
+  "conclusion_confidence": "low/medium/high",
+  "should_abstain": false
+}"""
+
 PROMPTS = {
     "standard": STANDARD_PROMPT,
     "safe": SAFE_PROMPT,
     "grounded": GROUNDED_PROMPT,
+    "neutral": NEUTRAL_PROMPT,
 }
 
 PROMPT_VERSIONS = {
     "standard": "standard_v4_neutral_contrastive",
     "safe": "safe_v4_neutral_contrastive",
     "grounded": "grounded_v5_evidence_gated",
+    "neutral": "neutral_v6_open_observation",
 }
 
 

@@ -1,16 +1,26 @@
 # c16_best_safe.yaml
 #
-# The "best run" config for Quilt-LLaVA on the CAMELYON16 stratified subset.
+# Reference config for the `safe`-prompt Quilt-LLaVA run on the CAMELYON16
+# stratified subset. The name is historical ("best") — it is NOT a verified best
+# config; keep it only to reproduce that specific run.
 #
-# This reproduces the run that discriminated tumor vs non-tumor tiles: the
-# `safe` prompt at temperature 0.4 / repetition_penalty 1.08. On the 100-patch
-# smoke it gave tumor_suspicious yes/no/unc = 49/50/1, 99% JSON valid, 96/100
-# unique raw responses. It over-calls malignancy on some benign tissue (~48% FP
-# on oracle_non_tumor) but it DOES call tumors.
+# What this run actually is: the `safe` prompt at temperature 0.4 /
+# repetition_penalty 1.08. It is fluent and rarely repeats, but on grounding
+# metrics it is near chance level against the tile mask:
+#   - full 424-patch run: sensitivity ~0.88, specificity ~0.12, balanced
+#     accuracy ~0.50 (see scripts/report_c16_metrics.py).
+#   - it over-calls tumor_suspicious=yes on benign tiles (the yes-bias).
+# The high "~99% JSON valid" figure is parse_valid AFTER \_ escape repair;
+# strict_json_valid on this run is ~0% (report_c16_groups.py). Do NOT quote the
+# 99% as a strict JSON-valid rate, and do not call this the best config.
 #
-# NOT the `grounded` variant: grounded (temp 0.2, evidence-gated) over-corrected
-# to a degenerate "always no" — 0 tumor calls across all 100 patches, including
-# every ground-truth oracle_tumor tile. Do not use grounded for the full run.
+# The `neutral` prompt (neutral_v6_open_observation) was added to remove the
+# safe prompt's pre-listed findings, which the model parrots back. The temp=0
+# neutral control run + 3x temp=0.4 variance runs are the intended comparison.
+#
+# The `grounded` variant (temp 0.2, evidence-gated) over-corrected to a
+# degenerate "always no" — 0 tumor calls across all 100 smoke patches, including
+# ground-truth oracle_tumor tiles. Not usable as-is either.
 #
 # This file is documentation of the exact parameters. The scripts are driven by
 # CLI args, not by YAML (see CLAUDE.md); the canonical invocation is under
@@ -26,9 +36,9 @@ dataset_name: c16_stratified_subset # 424 patches (full subset)
 
 model_name: wisdomik/Quilt-Llava-v1.5-7b
 
-# --- The parameters that made this the good run ---
+# --- The parameters for this reference run ---
 prompt_variant: safe # safe_v4_neutral_contrastive
-temperature: 0.4 # NOT 0.2 (grounded over-corrected at 0.2)
+temperature: 0.4 # stochastic; use temperature 0 for a reproducible control
 repetition_penalty: 1.08
 max_new_tokens: 768
 top_p: 0.95
@@ -52,11 +62,18 @@ output_dir: outputs/c16_best_safe_full
 #
 # Per-patch outputs (vlm_outputs.jsonl) already carry, for every patch:
 #   metadata (source/label/tile_in_mask/slide_id/x/y/attention_*), raw_response,
-#   parse_valid, json_valid, all parsed schema fields, tumor_suspicious,
-#   should_abstain, and the confidence fields (conclusion_confidence,
-#   visual_description_confidence, confidence).
+#   the JSON provenance flags (strict_json_valid, parse_valid, schema_valid,
+#   repair_stage; json_valid is a deprecated alias of parse_valid), seed, all
+#   parsed schema fields, tumor_suspicious, should_abstain, and the confidence
+#   fields (conclusion_confidence, visual_description_confidence, confidence).
 #
 # Grouped report (not one aggregate number) — table by source/label/tile_in_mask
-# with n, JSON valid, parse_valid, unique_raw, tumor yes/no/uncertain, abstain %:
+# with n, strict/parse/schema JSON rates, unique_raw, tumor yes/no/uncertain,
+# abstain %:
 #
 #   python scripts/report_c16_groups.py outputs/c16_best_safe_full/vlm_outputs.jsonl
+#
+# Grounding metrics (sensitivity/specificity/balanced accuracy, false-yes split
+# by mask) — the honest quality assessment:
+#
+#   python scripts/report_c16_metrics.py outputs/c16_best_safe_full/vlm_outputs.jsonl

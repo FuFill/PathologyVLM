@@ -105,6 +105,103 @@ def extract_json(text: str) -> Optional[dict]:
     return None
 
 
+# Required output keys for a schema-complete object (everything the model is
+# asked to emit; schema_version is added by us, not the model).
+REQUIRED_SCHEMA_KEYS = tuple(k for k in DEFAULT_SCHEMA if k != "schema_version")
+
+
+def _schema_valid(parsed: Optional[dict]) -> bool:
+    """True only if ``parsed`` already contains every required key with an
+    in-range value — checked BEFORE ``normalize_json`` fills/coerces anything.
+    """
+    if not isinstance(parsed, dict):
+        return False
+    for key in REQUIRED_SCHEMA_KEYS:
+        if key not in parsed:
+            return False
+    if _coerce_choice(parsed.get("tumor_suspicious"), _ALLOWED_TUMOR_SUSPICIOUS, "") == "":
+        return False
+    for key in ("visual_description_confidence", "conclusion_confidence"):
+        if _coerce_choice(parsed.get(key), _ALLOWED_CONFIDENCE, "") == "":
+            return False
+    if not isinstance(parsed.get("should_abstain"), bool):
+        return False
+    return True
+
+
+def parse_with_provenance(text: str) -> tuple[Optional[dict], dict]:
+    """Parse VLM output and report HOW it parsed, not just whether it did.
+
+    Returns ``(parsed, provenance)`` where provenance is::
+
+        {"strict_json_valid": bool,  # raw text valid JSON with NO repair
+         "parse_valid":       bool,  # a dict recovered by any means
+         "repair_stage":      str,   # strict | fence | escape | brace | none
+         "schema_valid":      bool}  # parsed dict already schema-complete
+
+    Mirrors ``src/json_utils.parse_with_provenance`` in the parent repo.
+    """
+    prov = {
+        "strict_json_valid": False,
+        "parse_valid": False,
+        "repair_stage": "none",
+        "schema_valid": False,
+    }
+    if not text or not isinstance(text, str):
+        return None, prov
+
+    # Stage 0: strict — raw text parses as a dict with no cleaning at all.
+    try:
+        strict = json.loads(text)
+        if isinstance(strict, dict):
+            prov["strict_json_valid"] = True
+            prov["parse_valid"] = True
+            prov["repair_stage"] = "strict"
+            prov["schema_valid"] = _schema_valid(strict)
+            return strict, prov
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    cleaned = _strip_markdown_fences(text)
+
+    # Stage 1: parsed after fence-strip, no escape repair needed.
+    try:
+        fenced = json.loads(cleaned)
+        if isinstance(fenced, dict):
+            prov["parse_valid"] = True
+            prov["repair_stage"] = "fence"
+            prov["schema_valid"] = _schema_valid(fenced)
+            return fenced, prov
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Stage 2: parsed after escape repair (the common \\_ case).
+    repaired = _repair_json_text(cleaned)
+    if repaired != cleaned:
+        try:
+            esc = json.loads(repaired)
+            if isinstance(esc, dict):
+                prov["parse_valid"] = True
+                prov["repair_stage"] = "escape"
+                prov["schema_valid"] = _schema_valid(esc)
+                return esc, prov
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Stage 3: brace-salvage (first '{' .. last '}', with repair retry).
+    first = cleaned.find("{")
+    last = cleaned.rfind("}")
+    if first != -1 and last != -1 and last > first:
+        salvaged = _try_loads(cleaned[first : last + 1])
+        if salvaged is not None:
+            prov["parse_valid"] = True
+            prov["repair_stage"] = "brace"
+            prov["schema_valid"] = _schema_valid(salvaged)
+            return salvaged, prov
+
+    return None, prov
+
+
 def _coerce_list(value: Any) -> list:
     if value is None:
         return []

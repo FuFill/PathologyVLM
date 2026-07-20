@@ -39,10 +39,14 @@ OUTPUT_FIELDS = [
     "temperature",
     "repetition_penalty",
     "max_new_tokens",
+    "seed",
     "git_commit",
     "raw_response",
-    "json_valid",
+    "strict_json_valid",
     "parse_valid",
+    "schema_valid",
+    "repair_stage",
+    "json_valid",
     "tissue_organ",
     "tissue_description",
     "cellularity",
@@ -237,6 +241,15 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--repetition_penalty", type=float, default=1.08, help="Repetition penalty."
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help=(
+            "RNG seed applied before each image's generation. Makes a sampled "
+            "(temperature>0) run repeatable; irrelevant to greedy (temperature=0)."
+        ),
     )
     parser.add_argument(
         "--load_4bit",
@@ -495,9 +508,13 @@ def _write_vlm_metadata_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "temperature",
         "repetition_penalty",
         "max_new_tokens",
+        "seed",
         "git_commit",
-        "json_valid",
+        "strict_json_valid",
         "parse_valid",
+        "schema_valid",
+        "repair_stage",
+        "json_valid",
         "tissue_organ",
         "tissue_description",
         "cellularity",
@@ -623,7 +640,7 @@ def main() -> int:
         import torch  # noqa: WPS433 (local import on purpose)
 
         from src.image_utils import find_images
-        from src.json_utils import SCHEMA_VERSION, extract_json, normalize_json
+        from src.json_utils import SCHEMA_VERSION, normalize_json, parse_with_provenance
         from src.vlm_inference import generate_answer, load_model
     except ImportError as exc:
         print(f"[run_remote_vlm] ERROR importing dependencies: {exc}", file=sys.stderr)
@@ -714,6 +731,7 @@ def main() -> int:
         "temperature": args.temperature,
         "repetition_penalty": args.repetition_penalty,
         "max_new_tokens": args.max_new_tokens,
+        "seed": args.seed,
         "git_commit": git_commit,
     }
     print(
@@ -731,6 +749,8 @@ def main() -> int:
     visualization_items: list[dict[str, Any]] = []
 
     n_valid_json = 0
+    n_strict_json = 0
+    n_schema_valid = 0
     metadata_matched = 0
 
     with jsonl_path.open("w", encoding="utf-8") as jfout:
@@ -760,8 +780,11 @@ def main() -> int:
                 "image_path": str(img_path),
                 "model_name": args.model_name,
                 "raw_response": "",
-                "json_valid": False,
+                "strict_json_valid": False,
                 "parse_valid": False,
+                "schema_valid": False,
+                "repair_stage": "none",
+                "json_valid": False,
                 "error": "",
             }
             row.update(provenance)
@@ -794,14 +817,22 @@ def main() -> int:
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
                     repetition_penalty=args.repetition_penalty,
+                    seed=args.seed,
                 )
                 row["raw_response"] = raw
 
-                parsed = extract_json(raw)
-                row["json_valid"] = parsed is not None
-                row["parse_valid"] = parsed is not None
-                if parsed is not None:
+                parsed, prov = parse_with_provenance(raw)
+                row["strict_json_valid"] = prov["strict_json_valid"]
+                row["parse_valid"] = prov["parse_valid"]
+                row["schema_valid"] = prov["schema_valid"]
+                row["repair_stage"] = prov["repair_stage"]
+                row["json_valid"] = prov["parse_valid"]  # deprecated alias
+                if prov["parse_valid"]:
                     n_valid_json += 1
+                if prov["strict_json_valid"]:
+                    n_strict_json += 1
+                if prov["schema_valid"]:
+                    n_schema_valid += 1
                 row.update(normalize_json(parsed))
             except Exception as exc:  # noqa: BLE001
                 err = f"{type(exc).__name__}: {exc}"
@@ -821,8 +852,11 @@ def main() -> int:
             export_row.update(copy.deepcopy(metadata_record))
 
             for key in (
+                "strict_json_valid",
                 "json_valid",
                 "parse_valid",
+                "schema_valid",
+                "repair_stage",
                 "tissue_organ",
                 "tissue_description",
                 "cellularity",
@@ -863,6 +897,18 @@ def main() -> int:
                 value=valid_rate,
                 iteration=processed,
             )
+            logger.report_scalar(
+                title="quality",
+                series="strict_json_valid_rate",
+                value=n_strict_json / processed,
+                iteration=processed,
+            )
+            logger.report_scalar(
+                title="quality",
+                series="schema_valid_rate",
+                value=n_schema_valid / processed,
+                iteration=processed,
+            )
 
     with csv_path.open("w", encoding="utf-8", newline="") as cfout:
         writer = csv.DictWriter(cfout, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
@@ -875,11 +921,18 @@ def main() -> int:
 
     n_total = len(rows)
     valid_rate = (n_valid_json / n_total) if n_total else 0.0
+    strict_rate = (n_strict_json / n_total) if n_total else 0.0
+    schema_rate = (n_schema_valid / n_total) if n_total else 0.0
     print(f"[run_remote_vlm] Wrote {jsonl_path}")
     print(f"[run_remote_vlm] Wrote {csv_path}")
     print(f"[run_remote_vlm] Wrote {vlm_metadata_path}")
     print(f"[run_remote_vlm] Wrote {visualizations_tar_path}")
-    print(f"[run_remote_vlm] num_images={n_total} valid_json_rate={valid_rate:.3f}")
+    print(
+        f"[run_remote_vlm] num_images={n_total} "
+        f"parse_valid_rate={valid_rate:.3f} "
+        f"strict_json_valid_rate={strict_rate:.3f} "
+        f"schema_valid_rate={schema_rate:.3f}"
+    )
 
     if metadata_rows:
         print(
@@ -891,6 +944,10 @@ def main() -> int:
         try:
             logger.report_single_value(name="num_images", value=n_total)
             logger.report_single_value(name="valid_json_rate", value=valid_rate)
+            logger.report_single_value(
+                name="strict_json_valid_rate", value=strict_rate
+            )
+            logger.report_single_value(name="schema_valid_rate", value=schema_rate)
         except Exception as exc:  # noqa: BLE001
             print(f"[run_remote_vlm] WARNING: could not report single values: {exc}")
 

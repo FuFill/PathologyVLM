@@ -21,8 +21,10 @@ before importing ``llava``.
 
 from __future__ import annotations
 
+import random
 import sys
 from pathlib import Path
+from typing import Optional
 
 import torch
 from PIL import Image, UnidentifiedImageError
@@ -33,7 +35,31 @@ QUILT_LLAVA_GIT = (
     "@7e70fc39f792ac55de010eb37bff0a6d6f491c13"
 )
 
+# Pinned Hugging Face weights revision. ``None`` means the loader takes the repo
+# default (current ``main``); set this to a specific commit sha / tag to pin the
+# exact weights used for a run and make it fully reproducible.
+MODEL_REVISION: Optional[str] = None
+
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
+
+
+def set_seed(seed: int) -> None:
+    """Seed Python / NumPy / Torch RNGs for reproducible sampling.
+
+    Makes a sampled (temperature>0) run repeatable given the same model, inputs
+    and kernels; does NOT make temperature>0 behave like greedy decoding. For a
+    deterministic control run use temperature=0.
+    """
+    random.seed(seed)
+    try:
+        import numpy as np
+
+        np.random.seed(seed)
+    except Exception:  # noqa: BLE001 — numpy optional
+        pass
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 # --------------------------------------------------------------------------- #
@@ -152,8 +178,16 @@ def bootstrap_llava() -> None:
 # --------------------------------------------------------------------------- #
 # Model load + generation
 # --------------------------------------------------------------------------- #
-def load_model(model_name: str, load_4bit: bool):
+def load_model(model_name: str, load_4bit: bool, revision: Optional[str] = None):
     """Load a Quilt-LLaVA / LLaVA-1.5 model via the upstream loader.
+
+    ``revision`` pins the Hugging Face weights commit/tag. The upstream
+    ``load_pretrained_model`` does NOT forward a ``revision`` argument, so we
+    enforce the pin by pre-downloading that exact revision into the HF cache
+    (via ``huggingface_hub.snapshot_download``) before the loader resolves the
+    repo. If the download step is unavailable we fall back to the default
+    revision but still record the requested value on every output row so the
+    discrepancy is auditable.
 
     Returns (tokenizer, model, image_processor, context_len).
     """
@@ -164,6 +198,16 @@ def load_model(model_name: str, load_4bit: bool):
     if load_4bit and not cuda_available:
         print("[quilt_vlm] WARNING: load_4bit=True but no CUDA; disabling 4bit.")
         load_4bit = False
+
+    if revision:
+        try:
+            from huggingface_hub import snapshot_download
+
+            print(f"[quilt_vlm] Pinning weights revision {revision} via snapshot_download")
+            snapshot_download(repo_id=model_name, revision=revision)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[quilt_vlm] WARNING: could not pin revision {revision}: {exc} "
+                  "(loading default revision; recorded value may not match weights).")
 
     short_name = get_model_name_from_path(model_name)
     print(f"[quilt_vlm] Loading model: {model_name} (short_name={short_name!r})")
@@ -191,6 +235,7 @@ def generate_answer(
     temperature: float,
     repetition_penalty: float = 1.08,
     top_p: float = 0.95,
+    seed: Optional[int] = None,
 ) -> str:
     """Run inference on a single image; return the raw decoded text.
 
@@ -280,6 +325,10 @@ def generate_answer(
     if do_sample:
         gen_kwargs["temperature"] = float(temperature)
         gen_kwargs["top_p"] = float(top_p)
+
+    # Seed immediately before generate so a sampled run is repeatable per-image.
+    if seed is not None:
+        set_seed(int(seed))
 
     with torch.inference_mode():
         output_ids = model.generate(input_ids, **gen_kwargs)
