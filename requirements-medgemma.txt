@@ -3,7 +3,7 @@ torch==2.8.0
 torchvision==0.23.0
 clearml==1.16.4
 transformers>=4.49.0
-tokenizers>=0.23.0
+tokenizers=0.23.0
 accelerate>=0.34.0
 safetensors>=0.4.5
 sentencepiece>=0.2.0
