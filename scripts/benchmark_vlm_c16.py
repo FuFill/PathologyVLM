@@ -86,50 +86,68 @@ def _run_model(
     seed: int,
     temperature: float,
 ) -> list[dict]:
+    import time
+    from collections import defaultdict
+
     print(f"\n{'='*60}")
     print(f"Running model: {model_key} ({backend.model_id()})")
     print(f"{'='*60}")
 
     backend.load(load_4bit=True)
 
+    slides: dict[str, list[dict]] = defaultdict(list)
+    for r in patches_df.to_dict("records"):
+        slides[r.get("slide_id", "unknown")].append(r)
+
+    sorted_slides = sorted(slides.items())
+    total_slides = len(sorted_slides)
+    total_patches = sum(len(v) for _, v in sorted_slides)
+
+    t0 = time.time()
     results = []
-    patch_records = patches_df.to_dict("records")
-    total = len(patch_records)
 
-    for idx, patch in enumerate(patch_records):
-        if idx % 50 == 0:
-            print(f"  [{idx}/{total}] {patch.get('slide_id', '?')} / {patch.get('selection_source', '?')}")
+    for slide_idx, (slide_id, slide_patches) in enumerate(sorted_slides):
+        n_patches = len(slide_patches)
+        print(f"\n  [{slide_idx+1}/{total_slides}] {slide_id} ({n_patches} patches)")
 
-        minio_path = str(patch.get("minio_path", ""))
-        local_path = _download_patch(minio_path, cache_dir) if minio_path else None
-        img = _load_image(local_path) if local_path and local_path.exists() else None
+        for pidx, patch in enumerate(slide_patches):
+            minio_path = str(patch.get("minio_path", ""))
+            local_path = _download_patch(minio_path, cache_dir) if minio_path else None
+            img = _load_image(local_path) if local_path and local_path.exists() else None
 
-        if img is None:
-            continue
+            if img is None:
+                continue
 
-        try:
-            raw = backend.generate(
-                images=[img],
-                prompt=PROMPT_TEMPLATE_SINGLE,
-                max_new_tokens=128,
-                temperature=temperature,
-                repetition_penalty=1.0,
-                seed=seed,
-            )
-        except Exception as exc:
-            raw = f"ERROR: {exc}"
+            try:
+                raw = backend.generate(
+                    images=[img],
+                    prompt=PROMPT_TEMPLATE_SINGLE,
+                    max_new_tokens=128,
+                    temperature=temperature,
+                    repetition_penalty=1.0,
+                    seed=seed,
+                )
+            except Exception as exc:
+                raw = f"ERROR: {exc}"
 
-        ans, valid = _parse_answer(raw)
-        results.append({
-            "model": model_key,
-            "patch_uid": str(patch.get("patch_uid", "")),
-            "slide_id": str(patch.get("slide_id", "")),
-            "selection_source": str(patch.get("selection_source", "")),
-            "tile_in_mask": int(patch.get("tumor_mask_overlap", 0)) if pd.notna(patch.get("tumor_mask_overlap")) else 0,
-            "raw_response": raw,
-            "answer": ans,
-            "parse_valid": valid,
-        })
+            ans, valid = _parse_answer(raw)
+            results.append({
+                "model": model_key,
+                "patch_uid": str(patch.get("patch_uid", "")),
+                "slide_id": slide_id,
+                "selection_source": str(patch.get("selection_source", "")),
+                "tile_in_mask": int(patch.get("tumor_mask_overlap", 0)) if pd.notna(patch.get("tumor_mask_overlap")) else 0,
+                "raw_response": raw,
+                "answer": ans,
+                "parse_valid": valid,
+            })
+            print(f"    [{pidx+1}/{n_patches}] answer: {ans}", end="\r")
+
+        slide_as = [r["answer"] for r in results if r["slide_id"] == slide_id]
+        print(f"    A={slide_as.count('A')} B={slide_as.count('B')} C={slide_as.count('C')}")
+
+    elapsed = time.time() - t0
+    print(f"\n  Done: {total_patches} patches, {total_slides} slides, {elapsed:.0f}s")
 
     return results
 
