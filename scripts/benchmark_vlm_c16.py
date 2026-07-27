@@ -43,8 +43,8 @@ def _compute_metrics(results: list[dict]) -> dict:
     n_b = sum(1 for r in results if r.get("answer") == "B")
     n_c = sum(1 for r in results if r.get("answer") == "C")
 
-    mask_pos = [r for r in results if r.get("patch_tile_in_mask") == 1]
-    mask_neg = [r for r in results if r.get("patch_tile_in_mask") == 0]
+    mask_pos = [r for r in results if r.get("tile_in_mask") == 1]
+    mask_neg = [r for r in results if r.get("tile_in_mask") == 0]
 
     tp = sum(1 for r in mask_pos if r.get("answer") == "A")
     fn = sum(1 for r in mask_pos if r.get("answer") in ("B", "C"))
@@ -55,7 +55,7 @@ def _compute_metrics(results: list[dict]) -> dict:
     specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
     balanced_acc = (sensitivity + specificity) / 2
 
-    unique_raw = len(set(r.get("raw_responses", [""])[0] for r in results if r.get("raw_responses")))
+    unique_raw = len(set(r.get("raw_response", "") for r in results if r.get("raw_response")))
 
     return {
         "n_total": n_total,
@@ -93,7 +93,15 @@ def _run_model(
     print(f"Running model: {model_key} ({backend.model_id()})")
     print(f"{'='*60}")
 
-    backend.load(load_4bit=True)
+    print(f"  Loading model weights...")
+    try:
+        backend.load(load_4bit=True)
+    except Exception as exc:
+        print(f"  [ERROR] Failed to load {model_key}: {exc}")
+        import traceback
+        traceback.print_exc()
+        raise
+    print(f"  Model loaded.")
 
     slides: dict[str, list[dict]] = defaultdict(list)
     for r in patches_df.to_dict("records"):
