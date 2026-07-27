@@ -28,6 +28,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.s3_utils import get_minio_path_components, get_s3_client, upload_to_s3
 
+REGISTRY_CSV_DEFAULT = "s3://pershin-medailab/Pathomorphology/CAMELYON/mil/vlm_patches_registry/patch_registry.csv"
+
 
 PROMPT_TEMPLATE_SINGLE = """You are a pathology AI analyzing an H&E stained lymph node tissue patch.
 
@@ -180,9 +182,22 @@ def _resolve_aggregate_answer(separate_results: list[str]) -> str:
     return "C"
 
 
+def _resolve_registry_csv(path: str) -> str:
+    if path.startswith("s3://"):
+        parts = path.replace("s3://", "", 1).split("/", 1)
+        if len(parts) == 2:
+            bucket, key = parts
+            client = get_s3_client()
+            tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+            client.download_file(bucket, key, tmp.name)
+            print(f"[run_vlm] Downloaded registry from {path} to {tmp.name}")
+            return tmp.name
+    return path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run VLM inference on patches")
-    parser.add_argument("--registry_csv", required=True, help="Path to patch_registry.csv (local or s3://)")
+    parser.add_argument("--registry_csv", default=REGISTRY_CSV_DEFAULT, help="Path to patch_registry.csv (local or s3://)")
     parser.add_argument("--model", default="quilt_llava", choices=[
         "quilt_llava", "med_gemma", "med_siglip",
     ])
@@ -220,8 +235,9 @@ def main() -> int:
     cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[run_vlm] Loading registry from {args.registry_csv}")
-    registry = pd.read_csv(args.registry_csv)
+    resolved_csv = _resolve_registry_csv(args.registry_csv)
+    print(f"[run_vlm] Loading registry from {resolved_csv}")
+    registry = pd.read_csv(resolved_csv)
     total_registry = len(registry)
     print(f"  Total registry entries: {total_registry}")
 
@@ -273,7 +289,7 @@ def main() -> int:
     if args.output:
         jsonl_path = Path(args.output)
     else:
-        jsonl_path = Path(f"/tmp/vlm_output_{model_key}_{args.mode}_{args.dataset}_{args.source}.jsonl")
+        jsonl_path = Path(tempfile.gettempdir()) / f"vlm_output_{model_key}_{args.mode}_{args.dataset}_{args.source}.jsonl"
 
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
 

@@ -33,6 +33,8 @@ from scripts.run_vlm import (
 )
 from src.s3_utils import get_s3_client, upload_to_s3
 
+REGISTRY_CSV_DEFAULT = "s3://pershin-medailab/Pathomorphology/CAMELYON/mil/vlm_patches_registry/patch_registry.csv"
+
 
 def _compute_metrics(results: list[dict]) -> dict:
     n_total = len(results)
@@ -147,7 +149,7 @@ def _resolve_registry(path: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Benchmark VLM models on C16 control patches")
-    parser.add_argument("--registry_csv", required=True)
+    parser.add_argument("--registry_csv", default=REGISTRY_CSV_DEFAULT)
     parser.add_argument("--model", default="all", choices=["all", "quilt_llava", "med_gemma", "med_siglip"])
     parser.add_argument("--output", default="")
     parser.add_argument("--output_s3", default="mil/vlm_results/c16_benchmark")

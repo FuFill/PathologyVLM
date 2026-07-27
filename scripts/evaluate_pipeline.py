@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 
@@ -19,7 +20,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.s3_utils import upload_to_s3
+from src.s3_utils import get_s3_client, upload_to_s3
+
+REGISTRY_CSV_DEFAULT = "s3://pershin-medailab/Pathomorphology/CAMELYON/mil/vlm_patches_registry/patch_registry.csv"
 
 
 def _load_jsonl(path: str) -> list[dict]:
@@ -117,8 +120,21 @@ def _compute_patient_metrics(rows: list[dict], ground_truth: dict[str, int]) -> 
     }
 
 
+def _resolve_registry_csv(path: str) -> str:
+    if path.startswith("s3://"):
+        parts = path.replace("s3://", "", 1).split("/", 1)
+        if len(parts) == 2:
+            bucket, key = parts
+            client = get_s3_client()
+            tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+            client.download_file(bucket, key, tmp.name)
+            print(f"[evaluate] Downloaded registry from {path} to {tmp.name}")
+            return tmp.name
+    return path
+
+
 def _build_ground_truth(registry_csv: str) -> dict[str, int]:
-    df = pd.read_csv(registry_csv)
+    df = pd.read_csv(_resolve_registry_csv(registry_csv))
     ground_truth: dict[str, int] = {}
 
     for slide_id in df["slide_id"].unique():
@@ -163,7 +179,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Pipeline-level evaluation")
     parser.add_argument("--top3_jsonl", required=True, help="Top-3 MIL VLM results JSONL")
     parser.add_argument("--random_jsonl", nargs="+", default=[], help="Random-3 VLM results JSONL(s)")
-    parser.add_argument("--registry_csv", required=True, help="Patch registry for ground truth")
+    parser.add_argument("--registry_csv", default=REGISTRY_CSV_DEFAULT, help="Patch registry for ground truth")
     parser.add_argument("--output", default="")
     parser.add_argument("--output_s3", default="mil/vlm_results")
     args = parser.parse_args()
@@ -205,7 +221,7 @@ def main() -> int:
     if args.output:
         output_path = Path(args.output)
     else:
-        output_path = Path("/tmp/pipeline_evaluation.json")
+        output_path = Path(tempfile.gettempdir()) / "pipeline_evaluation.json"
 
     all_results = {
         "ground_truth": {

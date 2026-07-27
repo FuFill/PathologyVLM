@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -19,7 +20,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.s3_utils import upload_to_s3
+from src.s3_utils import get_s3_client, upload_to_s3
+
+REGISTRY_CSV_DEFAULT = "s3://pershin-medailab/Pathomorphology/CAMELYON/mil/vlm_patches_registry/patch_registry.csv"
 
 
 def _load_jsonl(path: str) -> list[dict]:
@@ -31,9 +34,22 @@ def _load_jsonl(path: str) -> list[dict]:
     return rows
 
 
+def _resolve_registry_csv(path: str) -> str:
+    if path.startswith("s3://"):
+        parts = path.replace("s3://", "", 1).split("/", 1)
+        if len(parts) == 2:
+            bucket, key = parts
+            client = get_s3_client()
+            tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+            client.download_file(bucket, key, tmp.name)
+            print(f"[evaluate_patches] Downloaded registry from {path} to {tmp.name}")
+            return tmp.name
+    return path
+
+
 def _compute_patch_metrics(results_path: str, registry_csv: str) -> dict:
     rows = _load_jsonl(results_path)
-    registry = pd.read_csv(registry_csv)
+    registry = pd.read_csv(_resolve_registry_csv(registry_csv))
 
     uid_to_mask = {}
     for _, r in registry.iterrows():
@@ -107,7 +123,7 @@ def _compute_patch_metrics(results_path: str, registry_csv: str) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Patch-level VLM evaluation")
     parser.add_argument("--jsonl", required=True, help="VLM results JSONL")
-    parser.add_argument("--registry_csv", required=True, help="Patch registry CSV")
+    parser.add_argument("--registry_csv", default=REGISTRY_CSV_DEFAULT, help="Patch registry CSV")
     parser.add_argument("--output", default="")
     parser.add_argument("--output_s3", default="mil/vlm_results")
     args = parser.parse_args()
@@ -131,7 +147,7 @@ def main() -> int:
     if args.output:
         output_path = Path(args.output)
     else:
-        output_path = Path("/tmp/patch_evaluation.json")
+        output_path = Path(tempfile.gettempdir()) / "patch_evaluation.json"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False))

@@ -7,23 +7,26 @@ Usage:
   # Build patch registry (CPU, no ClearML needed)
   python scripts/build_patch_registry.py
 
-  # C16 benchmark on GPU
-  python scripts/run_clearml_vlm.py --step benchmark_c16 --queue gpu
+  # C16 benchmark on GPU (clearml-task without --args):
+  clearml-task --project pershin-medailab/Pathomorphology \
+    --name vlm_benchmark_medgemma \
+    --queue d33b6fa94d02482c818d4e0d45ae31cb \
+    --script scripts/benchmark_vlm_c16.py \
+    --docker pytorch/pytorch:2.8.0-cuda12.9-cudnn9-devel \
+    --requirements requirements-medgemma.txt
 
-  # C17 final run (Quilt-LLaVA)
-  python scripts/run_clearml_vlm.py --step run_c17 --model quilt_llava --queue gpu
-
-  # C17 final run (MedGemma)
-  python scripts/run_clearml_vlm.py --step run_c17 --model med_gemma --queue gpu
-
-  # Evaluate results (CPU)
-  python scripts/run_clearml_vlm.py --step evaluate --run_local
+  # C17 final run:
+  clearml-task --project pershin-medailab/Pathomorphology \
+    --name vlm_run_c17_medgemma \
+    --queue d33b6fa94d02482c818d4e0d45ae31cb \
+    --script scripts/run_vlm.py \
+    --docker pytorch/pytorch:2.8.0-cuda12.9-cudnn9-devel \
+    --requirements requirements-medgemma.txt
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 import sys
@@ -33,9 +36,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-
-REGISTRY_CSV = "mil/vlm_patches_registry/patch_registry.csv"
-REGISTRY_S3 = f"s3://pershin-medailab/Pathomorphology/CAMELYON/{REGISTRY_CSV}"
 
 STEPS = {
     "build_registry": {
@@ -48,23 +48,18 @@ STEPS = {
         "script": "benchmark_vlm_c16.py",
         "packages": "requirements-medgemma.txt",
         "gpu": True,
-        "args": [
-            "--registry_csv", REGISTRY_S3,
-            "--max_patches", "200",
-        ],
+        "args": [],
     },
     "run_c17": {
         "script": "run_vlm.py",
         "gpu": True,
-        "packages": "requirements-medgemma.txt",  # override with --model for quilt
+        "packages": "requirements-medgemma.txt",
         "args": [
-            "--registry_csv", REGISTRY_S3,
             "--dataset", "c17_native",
             "--source", "top_k",
             "--mode", "context",
             "--n_patches", "3",
             "--max_slides", "100",
-            "--temperature", "0.0",
         ],
     },
     "run_c17_random": {
@@ -72,14 +67,12 @@ STEPS = {
         "gpu": True,
         "packages": "requirements-medgemma.txt",
         "args": [
-            "--registry_csv", REGISTRY_S3,
             "--dataset", "c17_native",
             "--source", "random",
             "--mode", "context",
             "--n_patches", "3",
             "--max_slides", "100",
             "--random_seed", "42",
-            "--temperature", "0.0",
         ],
     },
     "run_c17_control": {
@@ -87,49 +80,26 @@ STEPS = {
         "gpu": True,
         "packages": "requirements-medgemma.txt",
         "args": [
-            "--registry_csv", REGISTRY_S3,
             "--dataset", "c17_native",
             "--source", "all",
             "--mode", "context",
             "--n_patches", "3",
             "--max_slides", "100",
-            "--temperature", "0.0",
         ],
     },
     "evaluate": {
         "script": "evaluate_pipeline.py",
         "packages": "requirements.txt",
         "gpu": False,
-        "args": [
-            "--registry_csv", REGISTRY_S3,
-        ],
+        "args": [],
     },
     "evaluate_patches": {
         "script": "evaluate_patches.py",
         "packages": "requirements.txt",
         "gpu": False,
-        "args": [
-            "--registry_csv", REGISTRY_S3,
-        ],
+        "args": [],
     },
 }
-
-
-def _resolve_s3_csv(s3_path: str) -> str:
-    """Download S3 CSV to local tmp and return local path."""
-    import tempfile
-    from src.s3_utils import get_s3_client
-
-    path = s3_path.replace("s3://pershin-medailab/", "").replace("s3://pershin-medailab/", "")
-    parts = path.split("/", 1)
-    if len(parts) < 2:
-        return s3_path
-
-    client = get_s3_client()
-    tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
-    client.download_file("pershin-medailab", path, tmp.name)
-    print(f"[clearml_vlm] Downloaded registry to {tmp.name}")
-    return tmp.name
 
 
 def main() -> int:
@@ -152,21 +122,13 @@ def main() -> int:
     script_path = str(PROJECT_ROOT / "scripts" / step_cfg["script"])
     req_path = str(PROJECT_ROOT / step_cfg["packages"])
 
-    add_model = args.step != "build_registry"
+    add_model = args.step not in ("build_registry", "evaluate", "evaluate_patches")
     task_name = f"vlm_{args.step}_{args.model if add_model else 'cpu'}"
 
     build_args = step_cfg["args"] + args.extra_args
     if add_model:
         build_args += ["--model", args.model]
     build_args = [a for a in build_args if a]
-
-    registry_s3 = next((a for a in build_args if a.startswith("s3://") and a.endswith(".csv")), None)
-
-    if registry_s3 and not args.run_local:
-        build_args = [REGISTRY_S3 if a == registry_s3 else a for a in build_args]
-    elif registry_s3 and args.run_local:
-        local_path = _resolve_s3_csv(registry_s3)
-        build_args = [local_path if a == registry_s3 else a for a in build_args]
 
     if args.run_local:
         print(f"[clearml_vlm] Running locally: {script_path}")
