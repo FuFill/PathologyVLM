@@ -84,13 +84,16 @@ class MedGemmaBackend(VLMBackend):
             }
         ]
 
-        model_inputs = self._processor.apply_chat_template(
+        formatted_text = self._processor.apply_chat_template(
             messages,
             add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
+            tokenize=False,
+        )
+        model_inputs = self._processor(
+            text=formatted_text,
+            images=images,
             padding=True,
+            return_tensors="pt",
         ).to(self._model.device)
 
         if seed is not None:
