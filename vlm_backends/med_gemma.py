@@ -88,13 +88,10 @@ class MedGemmaBackend(VLMBackend):
             messages,
             add_generation_prompt=True,
             tokenize=True,
+            return_dict=True,
             return_tensors="pt",
             padding=True,
-        )
-        model_inputs = {
-            k: v.to(self._model.device)
-            for k, v in model_inputs.items() if hasattr(v, "to")
-        }
+        ).to(self._model.device)
 
         if seed is not None:
             set_seed(seed)
