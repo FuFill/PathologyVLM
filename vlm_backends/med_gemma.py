@@ -91,23 +91,22 @@ class MedGemmaBackend(VLMBackend):
             return_tensors="pt",
             padding=True,
         )
-        input_ids = model_inputs["input_ids"].to(self._model.device)
-        attention_mask = model_inputs.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(self._model.device)
+        model_inputs = {
+            k: v.to(self._model.device)
+            for k, v in model_inputs.items() if hasattr(v, "to")
+        }
 
         if seed is not None:
             set_seed(seed)
 
         do_sample = temperature > 0.0
-        gen_kwargs = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
+        gen_kwargs = dict(model_inputs)
+        gen_kwargs.update({
             "pad_token_id": self._processor.tokenizer.eos_token_id,
             "do_sample": do_sample,
             "max_new_tokens": int(max_new_tokens),
             "use_cache": True,
-        }
+        })
         if do_sample:
             gen_kwargs["temperature"] = float(temperature)
             gen_kwargs["top_p"] = 0.95
@@ -117,7 +116,7 @@ class MedGemmaBackend(VLMBackend):
         with torch.inference_mode():
             output_ids = self._model.generate(**gen_kwargs)
 
-        input_len = input_ids.shape[1]
+        input_len = model_inputs["input_ids"].shape[1]
         new_tokens = output_ids[:, input_len:]
         decoded = self._processor.batch_decode(new_tokens, skip_special_tokens=True)[0]
 
