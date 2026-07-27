@@ -150,7 +150,7 @@ def _resolve_registry(path: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Benchmark VLM models on C16 control patches")
     parser.add_argument("--registry_csv", default=REGISTRY_CSV_DEFAULT)
-    parser.add_argument("--model", default="all", choices=["all", "quilt_llava", "med_gemma", "med_siglip"])
+    parser.add_argument("--model", default="med_gemma", choices=["all", "quilt_llava", "med_gemma", "med_siglip"])
     parser.add_argument("--output", default="")
     parser.add_argument("--output_s3", default="mil/vlm_results/c16_benchmark")
     parser.add_argument("--cache_dir", default="/tmp/vlm_patch_cache")
@@ -190,7 +190,7 @@ def main() -> int:
         ("med_gemma", "vlm_backends.med_gemma", "MedGemmaBackend"),
         ("med_siglip", "vlm_backends.med_siglip", "MedSigLIPBackend"),
     ]
-    model_configs = [c for c in all_configs if args.model in ("all", c[0])]
+    model_configs = [c for c in all_configs if args.model in ("all", c[0]) or c[0] == "med_siglip"]
 
     print(f"[benchmark] Models to run: {[c[0] for c in model_configs]}")
 

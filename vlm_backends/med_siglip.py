@@ -9,7 +9,7 @@ from PIL import Image
 from .base import VLMBackend
 
 
-MEDSIGLIP_MODEL_ID = "google/medsiglip-400m"
+MEDSIGLIP_MODEL_ID = "google/medsiglip-448"
 
 
 class MedSigLIPBackend(VLMBackend):
