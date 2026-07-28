@@ -19,6 +19,21 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+_siglip_target_size: int = 896
+
+
+def _pad_to_siglip(img: Image.Image, target: int = _siglip_target_size) -> Image.Image:
+    """Center-pad a patch to target×target with black borders, no upscale."""
+    w, h = img.size
+    if w == target and h == target:
+        return img
+    new = Image.new("RGB", (target, target), (0, 0, 0))
+    left = (target - w) // 2
+    top = (target - h) // 2
+    new.paste(img, (left, top))
+    return new
+
+
 class MedGemmaBackend(VLMBackend):
     def __init__(self) -> None:
         self._model = None
@@ -76,11 +91,12 @@ class MedGemmaBackend(VLMBackend):
         if self._model is None or self._processor is None:
             raise RuntimeError("Model not loaded. Call load() first.")
 
+        padded = [_pad_to_siglip(img) for img in images]
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": img} for img in images
+                    {"type": "image", "image": img} for img in padded
                 ] + [
                     {"type": "text", "text": prompt}
                 ],
