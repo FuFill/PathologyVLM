@@ -11,6 +11,7 @@ from .base import VLMBackend
 def set_seed(seed: int) -> None:
     import random
     import numpy as np
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -48,6 +49,8 @@ class MedGemmaBackend(VLMBackend):
             self.model_id(),
             revision=revision,
             token=True,
+            trust_remote_code=True,
+            use_fast=True,
         )
 
         self._model = Gemma3ForConditionalGeneration.from_pretrained(
@@ -84,29 +87,28 @@ class MedGemmaBackend(VLMBackend):
             }
         ]
 
-        formatted_text = self._processor.apply_chat_template(
+        model_inputs = self._processor.apply_chat_template(
             messages,
             add_generation_prompt=True,
-            tokenize=False,
-        )
-        model_inputs = self._processor(
-            text=formatted_text,
-            images=images,
-            padding=True,
+            tokenize=True,
+            return_dict=True,
             return_tensors="pt",
-        ).to(self._model.device)
+        )
+
+        model_inputs = model_inputs.to(self._model.device)
+        for key in ("pixel_values", "pixel_attention_mask"):
+            if key in model_inputs:
+                model_inputs[key] = model_inputs[key].to(dtype=torch.float16)
 
         if seed is not None:
             set_seed(seed)
 
         do_sample = temperature > 0.0
-        gen_kwargs = dict(model_inputs)
-        gen_kwargs.update({
-            "pad_token_id": self._processor.tokenizer.eos_token_id,
+        gen_kwargs = {
             "do_sample": do_sample,
             "max_new_tokens": int(max_new_tokens),
             "use_cache": True,
-        })
+        }
         if do_sample:
             gen_kwargs["temperature"] = float(temperature)
             gen_kwargs["top_p"] = 0.95
@@ -114,10 +116,12 @@ class MedGemmaBackend(VLMBackend):
             gen_kwargs["repetition_penalty"] = float(repetition_penalty)
 
         with torch.inference_mode():
-            output_ids = self._model.generate(**gen_kwargs)
+            output_ids = self._model.generate(**model_inputs, **gen_kwargs)
 
         input_len = model_inputs["input_ids"].shape[1]
         new_tokens = output_ids[:, input_len:]
-        decoded = self._processor.batch_decode(new_tokens, skip_special_tokens=True)[0]
+        decoded = self._processor.batch_decode(
+            new_tokens, skip_special_tokens=True
+        )[0]
 
         return decoded.strip()
