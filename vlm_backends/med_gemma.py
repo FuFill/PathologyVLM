@@ -76,32 +76,24 @@ class MedGemmaBackend(VLMBackend):
         if self._model is None or self._processor is None:
             raise RuntimeError("Model not loaded. Call load() first.")
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": img} for img in images
-                ] + [
-                    {"type": "text", "text": prompt}
-                ],
-            }
-        ]
-
-        model_inputs = self._processor.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
+        chat_text = (
+            "<start_of_turn>user\n"
+            + "\n".join("<image>" for _ in images)
+            + "\n" + prompt
+            + "\n<end_of_turn>\n<start_of_turn>model\n"
+        )
+        model_inputs = self._processor(
+            text=chat_text,
+            images=images,
+            padding=True,
             return_tensors="pt",
         )
-
         print(f"[DEBUG] model_inputs keys: {list(model_inputs.keys())}")
-        print(f"[DEBUG] input_ids shape: {model_inputs['input_ids'].shape}")
-        print(f"[DEBUG] input_ids: {model_inputs['input_ids'][0].tolist()}")
         if "pixel_values" in model_inputs:
             print(f"[DEBUG] pixel_values shape: {model_inputs['pixel_values'].shape}")
         else:
-            print(f"[DEBUG] WARNING: no pixel_values in model_inputs!")
+            print(f"[DEBUG] WARNING: no pixel_values!")
+        print(f"[DEBUG] input_ids len: {model_inputs['input_ids'].shape[1]}")
 
         model_inputs = model_inputs.to(self._model.device)
         for key in ("pixel_values", "pixel_attention_mask"):
@@ -130,12 +122,9 @@ class MedGemmaBackend(VLMBackend):
             output_ids = self._model.generate(**model_inputs, **gen_kwargs)
 
         input_len = model_inputs["input_ids"].shape[1]
-        print(f"[DEBUG] output_ids shape: {output_ids.shape}, input_len: {input_len}")
         new_tokens = output_ids[:, input_len:]
-        print(f"[DEBUG] new_tokens shape: {new_tokens.shape}, new_tokens: {new_tokens[0].tolist()}")
         decoded = self._processor.batch_decode(
             new_tokens, skip_special_tokens=True
         )[0]
-        print(f"[DEBUG] decoded: {repr(decoded)}")
 
         return decoded.strip()
