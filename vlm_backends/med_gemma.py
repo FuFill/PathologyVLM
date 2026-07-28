@@ -103,18 +103,22 @@ class MedGemmaBackend(VLMBackend):
             }
         ]
 
-        text_prompt = self._processor.apply_chat_template(
+        model_inputs = self._processor.apply_chat_template(
             messages,
             add_generation_prompt=True,
-            tokenize=False,
-        )
-
-        model_inputs = self._processor(
-            text=text_prompt,
-            images=padded,
+            tokenize=True,
             return_tensors="pt",
             padding=True,
         )
+
+        image_inputs = self._processor.image_processor(
+            padded,
+            return_tensors="pt",
+        )
+
+        model_inputs["pixel_values"] = image_inputs["pixel_values"]
+        if "pixel_attention_mask" in image_inputs:
+            model_inputs["pixel_attention_mask"] = image_inputs["pixel_attention_mask"]
 
         model_inputs = model_inputs.to(self._model.device)
         for key in ("pixel_values", "pixel_attention_mask"):
