@@ -92,6 +92,9 @@ class MedGemmaBackend(VLMBackend):
             raise RuntimeError("Model not loaded. Call load() first.")
 
         padded = [_pad_to_siglip(img) for img in images]
+        for i, (orig, p) in enumerate(zip(images, padded)):
+            print(f"[med_gemma] img{i}: {orig.size} -> {p.size}")
+
         messages = [
             {
                 "role": "user",
@@ -102,6 +105,13 @@ class MedGemmaBackend(VLMBackend):
                 ],
             }
         ]
+
+        prompt_debug = self._processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        print(f"[med_gemma] PROMPT:\n{prompt_debug}")
 
         model_inputs = self._processor.apply_chat_template(
             messages,
@@ -115,32 +125,46 @@ class MedGemmaBackend(VLMBackend):
         for key in ("pixel_values", "pixel_attention_mask"):
             if key in model_inputs:
                 model_inputs[key] = model_inputs[key].to(dtype=torch.float16)
+                print(f"[med_gemma] {key}: {model_inputs[key].shape}")
 
         model_inputs.pop("token_type_ids", None)
+
+        config_pad = self._model.config.pad_token_id if hasattr(self._model.config, 'pad_token_id') else None
+        config_eos = self._model.config.eos_token_id if hasattr(self._model.config, 'eos_token_id') else None
+        tok_pad = self._processor.tokenizer.pad_token_id
+        tok_eos = self._processor.tokenizer.eos_token_id
+        print(f"[med_gemma] pad_token_id: config={config_pad}, tokenizer={tok_pad}, eos={tok_eos}")
+        print(f"[med_gemma] input_ids[:, -5:]: {model_inputs['input_ids'][0, -5:].tolist()}")
 
         if seed is not None:
             set_seed(seed)
 
         do_sample = temperature > 0.0
         gen_kwargs = {
-            "pad_token_id": self._processor.tokenizer.eos_token_id,
             "do_sample": do_sample,
             "max_new_tokens": int(max_new_tokens),
             "use_cache": True,
         }
+        gen_kwargs["pad_token_id"] = self._processor.tokenizer.eos_token_id
         if do_sample:
             gen_kwargs["temperature"] = float(temperature)
             gen_kwargs["top_p"] = 0.95
         if repetition_penalty > 1.0:
             gen_kwargs["repetition_penalty"] = float(repetition_penalty)
 
+        print(f"[med_gemma] gen_kwargs: {gen_kwargs}")
+
         with torch.inference_mode():
             output_ids = self._model.generate(**model_inputs, **gen_kwargs)
 
         input_len = model_inputs["input_ids"].shape[1]
         new_tokens = output_ids[:, input_len:]
+        print(f"[med_gemma] output_ids shape: {output_ids.shape}, new_tokens len: {new_tokens.shape[1]}")
+        print(f"[med_gemma] new_tokens (first 20): {new_tokens[0, :20].tolist()}")
+
         decoded = self._processor.batch_decode(
             new_tokens, skip_special_tokens=True
         )[0]
 
+        print(f"[med_gemma] decoded: {repr(decoded)}")
         return decoded.strip()
