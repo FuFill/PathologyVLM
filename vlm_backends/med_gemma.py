@@ -76,24 +76,24 @@ class MedGemmaBackend(VLMBackend):
         if self._model is None or self._processor is None:
             raise RuntimeError("Model not loaded. Call load() first.")
 
-        chat_text = (
-            "<start_of_turn>user\n"
-            + "\n".join("<image>" for _ in images)
-            + "\n" + prompt
-            + "\n<end_of_turn>\n<start_of_turn>model\n"
-        )
-        model_inputs = self._processor(
-            text=chat_text,
-            images=images,
-            padding=True,
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": img} for img in images
+                ] + [
+                    {"type": "text", "text": prompt}
+                ],
+            }
+        ]
+
+        model_inputs = self._processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
             return_tensors="pt",
+            padding=True,
         )
-        print(f"[DEBUG] model_inputs keys: {list(model_inputs.keys())}")
-        if "pixel_values" in model_inputs:
-            print(f"[DEBUG] pixel_values shape: {model_inputs['pixel_values'].shape}")
-        else:
-            print(f"[DEBUG] WARNING: no pixel_values!")
-        print(f"[DEBUG] input_ids len: {model_inputs['input_ids'].shape[1]}")
 
         model_inputs = model_inputs.to(self._model.device)
         for key in ("pixel_values", "pixel_attention_mask"):
