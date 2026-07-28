@@ -108,11 +108,14 @@ class MedGemmaBackend(VLMBackend):
             if key in model_inputs:
                 model_inputs[key] = model_inputs[key].to(dtype=torch.float16)
 
+        model_inputs.pop("token_type_ids", None)
+
         if seed is not None:
             set_seed(seed)
 
         do_sample = temperature > 0.0
         gen_kwargs = {
+            "pad_token_id": self._processor.tokenizer.eos_token_id,
             "do_sample": do_sample,
             "max_new_tokens": int(max_new_tokens),
             "use_cache": True,
@@ -127,9 +130,12 @@ class MedGemmaBackend(VLMBackend):
             output_ids = self._model.generate(**model_inputs, **gen_kwargs)
 
         input_len = model_inputs["input_ids"].shape[1]
+        print(f"[DEBUG] output_ids shape: {output_ids.shape}, input_len: {input_len}")
         new_tokens = output_ids[:, input_len:]
+        print(f"[DEBUG] new_tokens shape: {new_tokens.shape}, new_tokens: {new_tokens[0].tolist()}")
         decoded = self._processor.batch_decode(
             new_tokens, skip_special_tokens=True
         )[0]
+        print(f"[DEBUG] decoded: {repr(decoded)}")
 
         return decoded.strip()
