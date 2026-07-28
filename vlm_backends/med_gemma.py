@@ -95,6 +95,14 @@ class MedGemmaBackend(VLMBackend):
             return_tensors="pt",
         )
 
+        print(f"[DEBUG] model_inputs keys: {list(model_inputs.keys())}")
+        print(f"[DEBUG] input_ids shape: {model_inputs['input_ids'].shape}")
+        print(f"[DEBUG] input_ids: {model_inputs['input_ids'][0].tolist()}")
+        if "pixel_values" in model_inputs:
+            print(f"[DEBUG] pixel_values shape: {model_inputs['pixel_values'].shape}")
+        else:
+            print(f"[DEBUG] WARNING: no pixel_values in model_inputs!")
+
         model_inputs = model_inputs.to(self._model.device)
         for key in ("pixel_values", "pixel_attention_mask"):
             if key in model_inputs:
