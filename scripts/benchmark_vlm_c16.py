@@ -1,71 +1,209 @@
 """Benchmark VLM models on C16 mask-positive vs mask-negative patches.
 
-Runs all configured models sequentially on the same clean control patches
-and produces a comparison table to select the best model.
+Per-slide per-group logic: for each (slide_id, selection_source) group,
+run VLM on every patch individually, compute sensitivity/specificity
+against tumor_mask_overlap ground truth.
 
-Usage:
-  python scripts/benchmark_vlm_c16.py --registry_csv <path> [--output_s3_prefix <s3>]
+Models to compare:
+  - MedGemma (generative)
+  - Quilt-LLaVA (generative)
+  - MedSigLIP (contrastive control)
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
+import io
 import json
+import re
+import subprocess
 import sys
+import tarfile
 import tempfile
-from collections import Counter, defaultdict
+import time
+from collections import defaultdict
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
+from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.run_vlm import (
-    PROMPT_TEMPLATE_SINGLE,
-    _build_patch_set_id,
-    _download_patch,
-    _git_commit,
-    _load_image,
-    _parse_answer,
+from src.s3_utils import get_minio_path_components, get_s3_client, upload_to_s3
+
+PROMPT_TEMPLATE_SINGLE = """You are a pathology AI analyzing an H&E stained lymph node tissue patch.
+
+Below is a tissue patch (P1) from a lymph node biopsy.
+
+Decide:
+- A: Tumor features are clearly visible in this patch
+- B: Tumor features are NOT visible in this patch
+- C: The presented data is insufficient to decide
+
+First, analyze the patch carefully. Then provide your FINAL ANSWER as a single letter (A, B, or C).
+
+FINAL ANSWER:"""
+
+PROMPT_TEMPLATE_CONTEXT = """You are a pathology AI analyzing H&E stained lymph node tissue patches.
+
+Below are three tissue patches (P1, P2, P3) from a lymph node biopsy.
+
+For each patch, decide:
+- A: Tumor features are clearly visible in this patch
+- B: Tumor features are NOT visible in this patch
+- C: The presented data is insufficient to decide
+
+First, analyze each patch independently. Then provide your FINAL ANSWER as a single letter (A, B, or C) based on the overall assessment:
+- A if tumor is evident in at least one patch
+- B if no tumor features are seen in any patch and tissue is adequate
+- C if tissue is inadequate, ambiguous, or you cannot make a determination
+
+FINAL ANSWER:"""
+
+PROMPT_TEMPLATE_SEPARATE = """You are a pathology AI analyzing an H&E stained lymph node tissue patch.
+
+Below is a tissue patch (P1) from a lymph node biopsy.
+
+Decide:
+- A: Tumor features are clearly visible in this patch
+- B: Tumor features are NOT visible in this patch
+- C: The presented data is insufficient to decide
+
+First, analyze the patch carefully. Then provide your FINAL ANSWER as a single letter (A, B, or C).
+
+FINAL ANSWER:"""
+
+
+def _git_commit() -> str:
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if res.returncode == 0:
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _parse_answer(raw: str) -> tuple[str, bool]:
+    text = raw.strip().upper()
+    m = re.search(r'\bFINAL\s*ANSWER\s*:\s*([ABC])', text)
+    if m:
+        return m.group(1), True
+    m = re.search(r'\bANSWER\s*:\s*([ABC])', text)
+    if m:
+        return m.group(1), True
+    m = re.search(r'\b([ABC])\b', text)
+    if m:
+        return m.group(1), True
+    return text[:50], False
+
+
+def _download_patch(minio_path: str, cache_dir: Path) -> Optional[Path]:
+    try:
+        tar_key, internal_path = get_minio_path_components(minio_path)
+    except Exception:
+        return None
+    if not internal_path:
+        cached = cache_dir / minio_path.replace("/", "_").replace(":", "_")
+        if cached.exists():
+            return cached
+        return None
+    cached = cache_dir / internal_path.replace("/", "_")
+    if cached.exists():
+        return cached
+    client = get_s3_client()
+    s3_path = tar_key
+    try:
+        obj = client.get_object(
+            Bucket="pershin-medailab",
+            Key=s3_path,
+        )
+        body = obj["Body"].read()
+        with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as tf:
+            try:
+                member = tf.getmember(internal_path)
+            except KeyError:
+                alt_path = internal_path.replace("vlm_patches/", "vlm_patches_standard/")
+                member = tf.getmember(alt_path)
+            f = tf.extractfile(member)
+            if f is None:
+                return None
+            img_data = f.read()
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(img_data)
+            return cached
+    except Exception as exc:
+        print(f"  [benchmark] WARNING: download failed for {internal_path}: {exc}")
+        return None
+
+
+def _load_image(path: Path) -> Optional[Image.Image]:
+    try:
+        img = Image.open(path)
+        img.load()
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        return img
+    except Exception:
+        return None
+
+
+def _resolve_aggregate_answer(separate_results: list[str]) -> str:
+    if any(r == "A" for r in separate_results):
+        return "A"
+    if all(r == "B" for r in separate_results):
+        return "B"
+    return "C"
+
+REGISTRY_CSV_DEFAULT = (
+    "s3://pershin-medailab/Pathomorphology/CAMELYON/"
+    "mil/vlm_patches_registry/patch_registry.csv"
 )
-from src.s3_utils import get_s3_client, upload_to_s3
 
-REGISTRY_CSV_DEFAULT = "s3://pershin-medailab/Pathomorphology/CAMELYON/mil/vlm_patches_registry/patch_registry.csv"
+C16_DATASETS = ("c16_native", "c17_to_c16")
+SOURCES_SINGLE = ("top_k", "oracle_tumor", "oracle_non_tumor", "hard_negative")
+RANDOM_SEEDS = (0, 1, 2)
 
 
-def _compute_metrics(results: list[dict]) -> dict:
-    n_total = len(results)
-    n_parsable = sum(1 for r in results if r.get("parse_valid"))
-    n_a = sum(1 for r in results if r.get("answer") == "A")
-    n_b = sum(1 for r in results if r.get("answer") == "B")
-    n_c = sum(1 for r in results if r.get("answer") == "C")
+def _per_group_metrics(records: list[dict]) -> dict:
+    """Compute sensitivity / specificity for one source group.
 
-    mask_pos = [r for r in results if r.get("tile_in_mask") == 1]
-    mask_neg = [r for r in results if r.get("tile_in_mask") == 0]
+    tumor_mask_overlap=1 (mask-pos): A = TP (tumor seen), B/C = FN
+    tumor_mask_overlap=0 (mask-neg): B = TN (no tumor), A/C = FP
+    """
+    n = len(records)
+    n_parsable = sum(1 for r in records if r.get("parse_valid"))
 
-    tp = sum(1 for r in mask_pos if r.get("answer") == "A")
-    fn = sum(1 for r in mask_pos if r.get("answer") in ("B", "C"))
-    tn = sum(1 for r in mask_neg if r.get("answer") == "B")
-    fp = sum(1 for r in mask_neg if r.get("answer") == "A")
+    pos = [r for r in records if r.get("tile_in_mask") == 1]
+    neg = [r for r in records if r.get("tile_in_mask") == 0]
 
-    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    tp = sum(1 for r in pos if r.get("answer") == "A")
+    fn = sum(1 for r in pos if r.get("answer") in ("B", "C"))
+    tn = sum(1 for r in neg if r.get("answer") == "B")
+    fp = sum(1 for r in neg if r.get("answer") == "A")
+
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
     balanced_acc = (sensitivity + specificity) / 2
 
-    unique_raw = len(set(r.get("raw_response", "") for r in results if r.get("raw_response")))
+    unique_raw = len(set(r.get("raw_response", "") for r in records if r.get("raw_response")))
 
     return {
-        "n_total": n_total,
+        "n": n,
         "n_parsable": n_parsable,
-        "parse_rate": n_parsable / n_total if n_total else 0.0,
-        "n_A": n_a,
-        "n_B": n_b,
-        "n_C": n_c,
-        "mask_pos_n": len(mask_pos),
-        "mask_neg_n": len(mask_neg),
+        "n_mask_pos": len(pos),
+        "n_mask_neg": len(neg),
         "TP": tp,
         "FN": fn,
         "TN": tn,
@@ -73,8 +211,8 @@ def _compute_metrics(results: list[dict]) -> dict:
         "sensitivity": sensitivity,
         "specificity": specificity,
         "balanced_accuracy": balanced_acc,
-        "unique_raw_responses": unique_raw,
-        "mode_collapse_ratio": unique_raw / n_total if n_total else 0.0,
+        "unique_raw": unique_raw,
+        "mode_collapse": unique_raw / n if n else 0.0,
     }
 
 
@@ -86,9 +224,6 @@ def _run_model(
     seed: int,
     temperature: float,
 ) -> list[dict]:
-    import time
-    from collections import defaultdict
-
     print(f"\n{'='*60}")
     print(f"Running model: {model_key} ({backend.model_id()})")
     print(f"{'='*60}")
@@ -103,27 +238,31 @@ def _run_model(
         raise
     print(f"  Model loaded.")
 
-    slides: dict[str, list[dict]] = defaultdict(list)
-    for r in patches_df.to_dict("records"):
-        slides[r.get("slide_id", "unknown")].append(r)
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for _, row in patches_df.iterrows():
+        src = str(row.get("selection_source", "unknown"))
+        seed_val = row.get("random_seed")
+        if src == "random" and pd.notna(seed_val):
+            group_key = f"random_seed_{int(seed_val)}"
+        else:
+            group_key = src
+        groups[group_key].append(row.to_dict())
 
-    sorted_slides = sorted(slides.items())
-    total_slides = len(sorted_slides)
-    total_patches = sum(len(v) for _, v in sorted_slides)
-
+    all_records: list[dict] = []
     t0 = time.time()
-    results = []
+    total = sum(len(v) for v in groups.values())
 
-    for slide_idx, (slide_id, slide_patches) in enumerate(sorted_slides):
-        n_patches = len(slide_patches)
-        print(f"\n  [{slide_idx+1}/{total_slides}] {slide_id} ({n_patches} patches)")
+    for group_key in sorted(groups):
+        group_patches = groups[group_key]
+        print(f"\n  --- {group_key} ({len(group_patches)} patches) ---")
 
-        for pidx, patch in enumerate(slide_patches):
+        for pi, patch in enumerate(group_patches):
             minio_path = str(patch.get("minio_path", ""))
             local_path = _download_patch(minio_path, cache_dir) if minio_path else None
             img = _load_image(local_path) if local_path and local_path.exists() else None
 
             if img is None:
+                print(f"    [{pi+1}/{len(group_patches)}] SKIP (no image)")
                 continue
 
             try:
@@ -139,25 +278,30 @@ def _run_model(
                 raw = f"ERROR: {exc}"
 
             ans, valid = _parse_answer(raw)
-            results.append({
+
+            all_records.append({
                 "model": model_key,
                 "patch_uid": str(patch.get("patch_uid", "")),
-                "slide_id": slide_id,
+                "slide_id": str(patch.get("slide_id", "")),
+                "group": group_key,
                 "selection_source": str(patch.get("selection_source", "")),
-                "tile_in_mask": int(patch.get("tumor_mask_overlap", 0)) if pd.notna(patch.get("tumor_mask_overlap")) else 0,
+                "tile_in_mask": (
+                    int(patch.get("tumor_mask_overlap", 0))
+                    if pd.notna(patch.get("tumor_mask_overlap"))
+                    else 0
+                ),
                 "raw_response": raw,
                 "answer": ans,
                 "parse_valid": valid,
             })
-            print(f"    [{pidx+1}/{n_patches}] answer: {ans}", end="\r")
+            print(f"    [{pi+1}/{len(group_patches)}] answer: {ans}", end="\r")
 
-        slide_as = [r["answer"] for r in results if r["slide_id"] == slide_id]
-        print(f"    A={slide_as.count('A')} B={slide_as.count('B')} C={slide_as.count('C')}")
+        group_as = [r["answer"] for r in all_records if r["group"] == group_key]
+        print(f"    A={group_as.count('A')} B={group_as.count('B')} C={group_as.count('C')}")
 
     elapsed = time.time() - t0
-    print(f"\n  Done: {total_patches} patches, {total_slides} slides, {elapsed:.0f}s")
-
-    return results
+    print(f"\n  Done: {total} patches, {elapsed:.0f}s")
+    return all_records
 
 
 def _resolve_registry(path: str) -> str:
@@ -174,39 +318,51 @@ def _resolve_registry(path: str) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Benchmark VLM models on C16 control patches")
+    parser = argparse.ArgumentParser(
+        description="Benchmark VLM models on C16 control patches"
+    )
     parser.add_argument("--registry_csv", default=REGISTRY_CSV_DEFAULT)
-    parser.add_argument("--model", default="med_gemma", choices=["all", "quilt_llava", "med_gemma", "med_siglip"])
+    parser.add_argument(
+        "--model",
+        default="med_gemma",
+        choices=["all", "quilt_llava", "med_gemma", "med_siglip"],
+    )
     parser.add_argument("--output", default="")
     parser.add_argument("--output_s3", default="mil/vlm_results/c16_benchmark")
     parser.add_argument("--cache_dir", default="/tmp/vlm_patch_cache")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max_patches", type=int, default=200)
     args = parser.parse_args()
 
     registry_path = _resolve_registry(args.registry_csv)
     print(f"[benchmark] Loading registry: {registry_path}")
     registry = pd.read_csv(registry_path)
+    print(f"  Total registry entries: {len(registry)}")
 
-    c16_mask_pos = registry[
-        (registry["dataset"].isin(["c16_native", "c17_to_c16"]))
-        & (registry["selection_source"].isin(["top_k", "oracle_tumor"]))
-        & (registry["tumor_mask_overlap"] == 1)
-        & (registry["is_diverse"] == 0)
-    ].head(args.max_patches // 2)
+    registry = registry[registry["dataset"].isin(C16_DATASETS)]
+    print(f"  After C16 dataset filter: {len(registry)}")
 
-    c16_mask_neg = registry[
-        (registry["dataset"].isin(["c16_native", "c17_to_c16"]))
-        & (registry["selection_source"].isin(["oracle_non_tumor", "hard_negative"]))
-        & (registry["tumor_mask_overlap"] == 0)
-        & (registry["is_diverse"] == 0)
-    ].head(args.max_patches // 2)
+    non_diverse = registry[registry.get("is_diverse", 0) == 0].copy()
+    non_random = non_diverse[non_diverse["selection_source"] != "random"]
+    random_part = non_diverse[non_diverse["selection_source"] == "random"].copy()
 
-    patches_df = pd.concat([c16_mask_pos, c16_mask_neg], ignore_index=True)
-    print(f"[benchmark] Selected {len(patches_df)} patches:")
-    print(f"  Mask-positive: {len(c16_mask_pos)}")
-    print(f"  Mask-negative: {len(c16_mask_neg)}")
+    if "random_seed" in random_part.columns:
+        for seed_val in RANDOM_SEEDS:
+            subset = random_part[random_part["random_seed"] == seed_val]
+            if not subset.empty:
+                n = len(subset)
+                print(f"    random_seed_{seed_val}: {n} patches")
+    else:
+        print("    WARNING: no random_seed column in registry")
+
+    patches_df = pd.concat([non_random, random_part], ignore_index=True)
+    print(f"  Total patches for benchmark: {len(patches_df)}")
+
+    slides_in_data = patches_df["slide_id"].nunique()
+    print(f"  Slides: {slides_in_data}")
+    for src in sorted(patches_df["selection_source"].unique()):
+        n = len(patches_df[patches_df["selection_source"] == src])
+        print(f"    {src}: {n}")
 
     cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -216,8 +372,10 @@ def main() -> int:
         ("med_gemma", "vlm_backends.med_gemma", "MedGemmaBackend"),
         ("med_siglip", "vlm_backends.med_siglip", "MedSigLIPBackend"),
     ]
-    model_configs = [c for c in all_configs if args.model in ("all", c[0]) or c[0] == "med_siglip"]
-
+    model_configs = [
+        c for c in all_configs
+        if args.model in ("all", c[0]) or c[0] == "med_siglip"
+    ]
     print(f"[benchmark] Models to run: {[c[0] for c in model_configs]}")
 
     all_results = {}
@@ -237,6 +395,8 @@ def main() -> int:
             all_results[model_key] = results
         except Exception as exc:
             print(f"[benchmark] SKIPPING {model_key}: {exc}")
+            import traceback
+            traceback.print_exc()
             all_results[model_key] = []
 
     print(f"\n{'='*70}")
@@ -244,19 +404,43 @@ def main() -> int:
     print(f"{'='*70}")
 
     rows = []
-    for model_key, results in all_results.items():
-        metrics = _compute_metrics(results)
-        rows.append(metrics)
-        print(f"\n  --- {model_key} ---")
-        for k, v in metrics.items():
-            if isinstance(v, float):
-                print(f"    {k}: {v:.4f}")
-            else:
-                print(f"    {k}: {v}")
+    for model_key, records in all_results.items():
+        print(f"\n  === {model_key} ===")
+
+        groups_in_data = sorted(set(r["group"] for r in records))
+        for gk in groups_in_data:
+            grp = [r for r in records if r["group"] == gk]
+            m = _per_group_metrics(grp)
+            rows.append({"model": model_key, "group": gk, **m})
+            print(f"\n    --- {gk} (n={m['n']}) ---")
+            for k in ("n_parsable", "sensitivity", "specificity", "balanced_accuracy",
+                      "n_mask_pos", "n_mask_neg", "TP", "FN", "TN", "FP",
+                      "unique_raw", "mode_collapse"):
+                v = m[k]
+                if isinstance(v, float):
+                    print(f"      {k}: {v:.4f}")
+                else:
+                    print(f"      {k}: {v}")
+            print()
+
+        total_n = len(records)
+        pos_recs = [r for r in records if r.get("tile_in_mask") == 1]
+        neg_recs = [r for r in records if r.get("tile_in_mask") == 0]
+        tp = sum(1 for r in pos_recs if r.get("answer") == "A")
+        fn = sum(1 for r in pos_recs if r.get("answer") in ("B", "C"))
+        tn = sum(1 for r in neg_recs if r.get("answer") == "B")
+        fp = sum(1 for r in neg_recs if r.get("answer") == "A")
+        sens_total = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+        spec_total = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
+        bacc_total = (sens_total + spec_total) / 2
+        print(f"    --- ALL GROUPS (n={total_n}) ---")
+        print(f"      mask-pos: {len(pos_recs)}, mask-neg: {len(neg_recs)}")
+        print(f"      TP={tp} FN={fn} TN={tn} FP={fp}")
+        print(f"      sensitivity: {sens_total:.4f}")
+        print(f"      specificity: {spec_total:.4f}")
+        print(f"      balanced_accuracy: {bacc_total:.4f}")
 
     summary_df = pd.DataFrame(rows)
-    summary_df.index = [r for r in all_results.keys()]
-
     if args.output:
         output_path = Path(args.output)
     else:
@@ -268,15 +452,15 @@ def main() -> int:
         "config": {
             "seed": args.seed,
             "temperature": args.temperature,
-            "max_patches": args.max_patches,
         },
-        "models": all_results,
-        "metrics": {k: v for k, v in zip(all_results.keys(), rows)},
+        "models": {
+            k: v for k, v in all_results.items()
+        },
     }
     output_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
 
     csv_path = output_path.with_suffix(".csv")
-    summary_df.to_csv(csv_path)
+    summary_df.to_csv(csv_path, index=False)
 
     for f in [output_path, csv_path]:
         s3_key = f"{args.output_s3}/{f.name}"
@@ -284,7 +468,6 @@ def main() -> int:
         print(f"  Uploaded: {url}")
 
     print(f"\n[benchmark] Done. Results at {output_path}")
-
     return 0
 
 
