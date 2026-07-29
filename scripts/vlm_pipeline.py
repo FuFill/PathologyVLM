@@ -372,7 +372,12 @@ def run_inference(
             parse_valid = False
 
         elapsed = time.time() - t0
-        print(f"  [{idx}/{total}] {group}/{mode} → {aggregate} ({elapsed:.0f}s)")
+        ans_str = aggregate if aggregate else "∅"
+        if ans_str not in ("A", "B", "C"):
+            for ri, r in enumerate(raw_responses):
+                trunc = r[:300].replace("\n", "\\n")
+                print(f"    RAW[{ri}]: {trunc}")
+        print(f"  [{idx}/{total}] {group}/{mode} → {ans_str} ({elapsed:.0f}s)")
 
         record = {
             "patch_set_uid": set_id,
