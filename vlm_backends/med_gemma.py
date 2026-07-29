@@ -234,7 +234,8 @@ class MedGemmaBackend(VLMBackend):
         diag_argmax = diag_last.argmax().item()
         top5_vals, top5_ids = diag_last.topk(5)
         _dbg(f"diagnostic forward logits[-1]: argmax={diag_argmax}, "
-             f"top5_ids={top5_ids.tolist()}, top5_vals={top5_vals.tolist():.4f}")
+             f"top5_ids={top5_ids.tolist()}, "
+             f"top5_vals={[f'{v:.4f}' for v in top5_vals.tolist()]}")
         del diag_out, diag_logits
 
         with torch.inference_mode():
