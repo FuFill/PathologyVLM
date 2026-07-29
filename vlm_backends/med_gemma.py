@@ -113,52 +113,39 @@ class MedGemmaBackend(VLMBackend):
             }
         ]
 
-        input_ids = self._processor.tokenizer.apply_chat_template(
+        model_inputs = self._processor.apply_chat_template(
             messages,
             add_generation_prompt=True,
             tokenize=True,
             return_tensors="pt",
             padding=True,
+            return_dict=True,
         )
-        print(f"[med_gemma] input_ids type: {type(input_ids).__name__}")
-        if isinstance(input_ids, dict):
-            print(f"[med_gemma] input_ids keys: {list(input_ids.keys())}")
-            ids_tensor = input_ids["input_ids"]
-        else:
-            print(f"[med_gemma] input_ids is tensor, shape: {input_ids.shape}")
-            ids_tensor = input_ids
-
-        print(f"[med_gemma] input_ids decoded:\n{self._processor.tokenizer.decode(ids_tensor[0])}")
 
         image_inputs = self._processor.image_processor(
             padded,
             return_tensors="pt",
         )
-        print(f"[med_gemma] pixel_values shape: {image_inputs['pixel_values'].shape}, dtype: {image_inputs['pixel_values'].dtype}")
 
-        model_inputs: dict = {
-            "input_ids": ids_tensor.to(self._model.device),
-            "attention_mask": torch.ones_like(ids_tensor, device=self._model.device),
-            "pixel_values": image_inputs["pixel_values"].to(
-                device=self._model.device, dtype=torch.float16
-            ),
-        }
+        model_inputs["pixel_values"] = image_inputs["pixel_values"]
         if "pixel_attention_mask" in image_inputs:
-            model_inputs["pixel_attention_mask"] = image_inputs["pixel_attention_mask"].to(
-                device=self._model.device, dtype=torch.float16
-            )
+            model_inputs["pixel_attention_mask"] = image_inputs["pixel_attention_mask"]
+
+        model_inputs.pop("token_type_ids", None)
+
+        model_inputs = model_inputs.to(self._model.device)
+        for key in ("pixel_values", "pixel_attention_mask"):
+            if key in model_inputs:
+                model_inputs[key] = model_inputs[key].to(dtype=torch.float16)
 
         if seed is not None:
             set_seed(seed)
-
-        self._processor.tokenizer.pad_token_id = 0
 
         do_sample = temperature > 0.0
         gen_kwargs = {
             "do_sample": do_sample,
             "max_new_tokens": int(max_new_tokens),
             "use_cache": True,
-            "pad_token_id": 0,
         }
         if do_sample:
             gen_kwargs["temperature"] = float(temperature)
@@ -168,13 +155,11 @@ class MedGemmaBackend(VLMBackend):
 
         with torch.inference_mode():
             output_ids = self._model.generate(**model_inputs, **gen_kwargs)
-        print(f"[med_gemma] output_ids shape: {output_ids.shape}")
 
         input_len = model_inputs["input_ids"].shape[1]
         new_tokens = output_ids[:, input_len:]
-        print(f"[med_gemma] new_tokens ids: {new_tokens.tolist()}")
         decoded = self._processor.batch_decode(
             new_tokens, skip_special_tokens=True
         )[0]
-        print(f"[med_gemma] decoded: |{decoded}|")
+
         return decoded.strip()
