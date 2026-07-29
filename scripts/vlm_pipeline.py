@@ -1,0 +1,639 @@
+"""VLM inference pipeline for C16 control and C17 final evaluation.
+
+Modes:
+  single   — 1 best patch (top-1 by rank) per slide, 1 VLM call
+  separate — 3 patches, 3 separate VLM calls, aggregate (any A→A, all B→B, else C)
+  context  — 3 patches in one multi-image prompt, 1 VLM call
+
+Sources:
+  top_k              — MIL top attention patches
+  random             — random patches (3 fixed seeds: 42, 123, 456)
+  oracle_tumor       — mask-positive controls
+  oracle_non_tumor   — mask-negative controls
+  hard_negative      — high-attention non-tumor patches
+  diverse            — spatially-diversified top_k (context_set=diverse)
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib
+import io
+import json
+import re
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import traceback
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Optional
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.s3_utils import get_minio_path_components, get_s3_client, upload_to_s3
+
+REGISTRY_CSV_DEFAULT = (
+    "s3://pershin-medailab/Pathomorphology/CAMELYON/"
+    "mil/vlm_patches_registry/patch_registry.csv"
+)
+
+C16_DATASETS = ("c16_native", "c17_to_c16")
+C17_DATASETS = ("c17_native", "c16_to_c17")
+
+RANDOM_SEEDS = (42, 123, 456)
+
+PROMPT_SINGLE = """You are a pathology AI analyzing an H&E stained lymph node tissue patch.
+
+Below is a tissue patch (P1) from a lymph node biopsy.
+
+Decide:
+- A: Tumor features are clearly visible in this patch
+- B: Tumor features are NOT visible in this patch
+- C: The presented data is insufficient to decide
+
+First, analyze the patch carefully. Then provide your FINAL ANSWER as a single letter (A, B, or C).
+
+FINAL ANSWER:"""
+
+PROMPT_CONTEXT = """You are a pathology AI analyzing H&E stained lymph node tissue patches.
+
+Below are three tissue patches (P1, P2, P3) from a lymph node biopsy.
+
+Decide:
+- A: Tumor features are clearly visible in at least one patch
+- B: Tumor features are NOT visible in any patch
+- C: The presented data is insufficient to decide
+
+First, analyze each patch independently. Then provide your FINAL ANSWER as a single letter (A, B, or C).
+
+FINAL ANSWER:"""
+
+
+def _git_commit() -> str:
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(PROJECT_ROOT), capture_output=True, text=True, timeout=10,
+        )
+        if res.returncode == 0:
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _parse_answer(raw: str) -> tuple[str, bool]:
+    text = raw.strip().upper()
+    m = re.search(r'\bFINAL\s*ANSWER\s*:\s*([ABC])', text)
+    if m:
+        return m.group(1), True
+    m = re.search(r'\bANSWER\s*:\s*([ABC])', text)
+    if m:
+        return m.group(1), True
+    m = re.search(r'\b([ABC])\b', text)
+    if m:
+        return m.group(1), True
+    if text.startswith("A") or text.startswith("B") or text.startswith("C"):
+        return text[0], True
+    return text[:80], False
+
+
+def _aggregate_separate(answers: list[str]) -> str:
+    if any(a == "A" for a in answers):
+        return "A"
+    if all(a == "B" for a in answers):
+        return "B"
+    return "C"
+
+
+def _download_patch(minio_path: str, cache_dir: Path) -> Optional[Path]:
+    try:
+        tar_key, internal_path = get_minio_path_components(minio_path)
+    except Exception:
+        return None
+    if not internal_path:
+        cached = cache_dir / minio_path.replace("/", "_").replace(":", "_")
+        return cached if cached.exists() else None
+    cached = cache_dir / internal_path.replace("/", "_")
+    if cached.exists():
+        return cached
+    client = get_s3_client()
+    s3_path = tar_key
+    try:
+        obj = client.get_object(Bucket="pershin-medailab", Key=s3_path)
+        body = obj["Body"].read()
+        with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as tf:
+            try:
+                member = tf.getmember(internal_path)
+            except KeyError:
+                alt = internal_path.replace("vlm_patches/", "vlm_patches_standard/")
+                member = tf.getmember(alt)
+            f = tf.extractfile(member)
+            if f is None:
+                return None
+            img_data = f.read()
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(img_data)
+            return cached
+    except Exception as exc:
+        print(f"  [pipeline] WARNING: download failed {internal_path}: {exc}")
+        return None
+
+
+def _load_image(path: Path) -> Optional[Image.Image]:
+    try:
+        img = Image.open(path)
+        img.load()
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        return img
+    except Exception:
+        return None
+
+
+def _resolve_registry_csv(path: str) -> str:
+    if path.startswith("s3://"):
+        parts = path.replace("s3://", "", 1).split("/", 1)
+        if len(parts) == 2:
+            bucket, key = parts
+            client = get_s3_client()
+            tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+            client.download_file(bucket, key, tmp.name)
+            print(f"[pipeline] Downloaded registry to {tmp.name}")
+            return tmp.name
+    return path
+
+
+def _patch_set_uid(patches: list[dict]) -> str:
+    raw = "|".join(
+        str(p.get("region_uid", p.get("patch_uid", ""))) for p in patches
+    )
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def load_registry(
+    csv_path: str,
+    datasets: tuple[str, ...],
+    sources: tuple[str, ...] | None,
+    max_slides: int = 0,
+) -> pd.DataFrame:
+    path = _resolve_registry_csv(csv_path)
+    print(f"[pipeline] Loading registry: {path}")
+    df = pd.read_csv(path)
+    print(f"  Total: {len(df)} entries")
+
+    df = df[df["dataset"].isin(datasets)]
+    print(f"  After dataset filter {datasets}: {len(df)}")
+
+    if sources:
+        df = df[df["selection_source"].isin(sources)]
+        print(f"  After source filter {sources}: {len(df)}")
+
+    slides = sorted(df["slide_id"].unique())
+    if max_slides > 0:
+        keep = set(slides[:max_slides])
+        df = df[df["slide_id"].isin(keep)]
+        print(f"  After slide cap {max_slides}: {len(df)}")
+
+    return df
+
+
+def build_patch_sets(
+    registry: pd.DataFrame,
+    source: str,
+    n_patches: int,
+    context_set: str = "standard",
+) -> list[list[dict]]:
+    """Build list of patch sets (each set is list of patch dicts).
+
+    For random source: returns 3 separate lists (one per seed).
+    For all others: 1 list.
+    """
+    if source == "diverse":
+        sub = registry[registry["context_set"] == "diverse"].copy()
+        source_key = "top_k"
+    else:
+        sub = registry[registry["context_set"] == context_set].copy()
+        source_key = source
+
+    if source == "random":
+        all_sets = []
+        for seed_val in RANDOM_SEEDS:
+            seed_sub = sub[
+                (sub["selection_source"] == "random") &
+                (sub["random_seed"] == seed_val)
+            ]
+            sets = _build_per_slide_sets(seed_sub, source_key, n_patches)
+            all_sets.extend(sets)
+        return all_sets
+
+    sub = sub[sub["selection_source"] == source_key]
+    return _build_per_slide_sets(sub, source_key, n_patches)
+
+
+def _build_per_slide_sets(
+    df: pd.DataFrame,
+    source_key: str,
+    n_patches: int,
+) -> list[list[dict]]:
+    sets = []
+    for slide_id in sorted(df["slide_id"].unique()):
+        slide_patches = df[df["slide_id"] == slide_id].sort_values("rank")
+        patches = slide_patches.head(n_patches).to_dict("records")
+        if len(patches) >= 1:
+            sets.append(patches)
+    return sets
+
+
+def run_inference(
+    backend,
+    patch_sets: list[list[dict]],
+    mode: str,
+    cache_dir: Path,
+    seed: int,
+    temperature: float,
+    repetition_penalty: float,
+    max_new_tokens: int,
+    backend_config: dict,
+    git_commit: str,
+) -> list[dict]:
+    all_records = []
+    total = len(patch_sets)
+    t0 = time.time()
+
+    print(f"[pipeline] Running {mode} mode on {total} patch sets")
+
+    for idx, patches in enumerate(patch_sets):
+        slide_id = patches[0].get("slide_id", "unknown")
+        source = patches[0].get("selection_source", "unknown")
+        group = f"{slide_id}/{source}"
+
+        if idx % 10 == 0:
+            elapsed = time.time() - t0
+            print(f"  [{idx}/{total}] {group} ({elapsed:.0f}s)")
+
+        set_id = _patch_set_uid(patches)
+
+        pil_images: list[Image.Image] = []
+        patch_metas: dict[str, dict] = {}
+
+        for pi, patch in enumerate(patches):
+            key = f"P{pi + 1}"
+            minio_path = str(patch.get("minio_path", ""))
+            local_path = _download_patch(minio_path, cache_dir) if minio_path else None
+            img = _load_image(local_path) if local_path and local_path.exists() else None
+            if img is None:
+                print(f"    WARNING: could not load {key} ({patch.get('patch_uid', '?')})")
+                continue
+            pil_images.append(img)
+            patch_metas[key] = {
+                "region_uid": str(patch.get("region_uid", "")),
+                "patch_uid": str(patch.get("patch_uid", "")),
+                "rank": int(patch.get("rank", 0)) if pd.notna(patch.get("rank")) else 0,
+                "selection_source": source,
+                "tumor_mask_overlap": int(patch.get("tumor_mask_overlap", 0)),
+                "relative_path": str(patch.get("relative_path", "")),
+                "tissue_fraction": float(patch.get("tissue_fraction", 1.0)),
+                "context_set": str(patch.get("context_set", "")),
+            }
+
+        if not pil_images:
+            continue
+
+        raw_responses: list[str] = []
+        per_patch_answers: list[str] = []
+        error: str = ""
+
+        try:
+            if mode == "separate":
+                prompt = PROMPT_SINGLE
+                for img in pil_images:
+                    raw = backend.generate(
+                        images=[img],
+                        prompt=prompt,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        repetition_penalty=repetition_penalty,
+                        seed=seed,
+                    )
+                    raw_responses.append(raw)
+                    ans, _ = _parse_answer(raw)
+                    per_patch_answers.append(ans)
+                aggregate = _aggregate_separate(per_patch_answers)
+            elif mode == "context":
+                prompt = PROMPT_CONTEXT
+                raw = backend.generate(
+                    images=pil_images,
+                    prompt=prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    seed=seed,
+                )
+                raw_responses = [raw]
+                ans, _ = _parse_answer(raw)
+                aggregate = ans
+                per_patch_answers = [ans]
+            else:
+                prompt = PROMPT_SINGLE
+                raw = backend.generate(
+                    images=[pil_images[0]],
+                    prompt=prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    seed=seed,
+                )
+                raw_responses = [raw]
+                ans, _ = _parse_answer(raw)
+                aggregate = ans
+                per_patch_answers = [ans]
+
+            parse_valid = aggregate in ("A", "B", "C")
+
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            traceback.print_exc()
+            aggregate = ""
+            parse_valid = False
+
+        record = {
+            "patch_set_uid": set_id,
+            "slide_id": slide_id,
+            "patient_id": str(patches[0].get("patient_id", "")),
+            "dataset": str(patches[0].get("dataset", "")),
+            "selection_source": source,
+            "group_label": f"{slide_id}/{source}/{mode}",
+            "model_name": backend_config["model_id"],
+            "model_revision": backend_config["revision"],
+            "quantization": backend_config["quantization"],
+            "mode": mode,
+            "temperature": temperature,
+            "repetition_penalty": repetition_penalty,
+            "max_new_tokens": max_new_tokens,
+            "seed": seed,
+            "git_commit": git_commit,
+            "n_patches_shown": len(pil_images),
+            "patches": patch_metas,
+            "prompt": prompt,
+            "raw_responses": raw_responses,
+            "per_patch_answers": per_patch_answers,
+            "answer": aggregate,
+            "parse_valid": parse_valid,
+            "error": error,
+        }
+        all_records.append(record)
+
+    elapsed = time.time() - t0
+    print(f"[pipeline] Done: {len(all_records)}/{total} sets, {elapsed:.0f}s")
+    return all_records
+
+
+def compute_metrics(results: list[dict], slide_labels: dict[str, int] | None = None) -> dict:
+    """Two-level metrics.
+
+    Level 1 — slide-level (if slide_labels provided):
+      sens, spec, balanced_acc, top_k vs random advantage
+
+    Level 2 — patch-level (always):
+      false tumor on mask-neg, missed tumor on mask-pos,
+      correct abstention, coverage
+    """
+    metrics = {}
+
+    valid = [r for r in results if r["parse_valid"]]
+    metrics["total_sets"] = len(results)
+    metrics["valid_sets"] = len(valid)
+    metrics["coverage"] = len(valid) / max(len(results), 1)
+
+    ans_counts = defaultdict(int)
+    for r in valid:
+        ans_counts[r["answer"]] += 1
+    metrics["answer_distribution"] = dict(ans_counts)
+
+    pos_patches = 0
+    neg_patches = 0
+    false_tumor = 0
+    missed_tumor = 0
+    correct_abstain = 0
+    mixed_total = 0
+
+    for r in valid:
+        patch_masks = [
+            p.get("tumor_mask_overlap", -1)
+            for p in r["patches"].values()
+        ]
+        has_pos = any(m == 1 for m in patch_masks)
+        has_neg = any(m == 0 for m in patch_masks)
+
+        if has_pos:
+            pos_patches += 1
+            if r["answer"] in ("B", "C"):
+                missed_tumor += 1
+        if has_neg and not has_pos:
+            neg_patches += 1
+            if r["answer"] == "A":
+                false_tumor += 1
+        if has_pos and has_neg:
+            mixed_total += 1
+            if r["answer"] == "C":
+                correct_abstain += 1
+
+    metrics["patch_level"] = {
+        "sets_with_mask_pos": pos_patches,
+        "sets_with_only_mask_neg": neg_patches,
+        "false_tumor_on_neg": false_tumor,
+        "missed_tumor_on_pos": missed_tumor,
+        "mixed_sets": mixed_total,
+        "correct_abstain_on_mixed": correct_abstain,
+    }
+
+    if slide_labels:
+        tp = sum(1 for r in valid if r["answer"] == "A" and slide_labels.get(r["slide_id"], 0) == 1)
+        fn = sum(1 for r in valid if r["answer"] in ("B", "C") and slide_labels.get(r["slide_id"], 0) == 1)
+        tn = sum(1 for r in valid if r["answer"] == "B" and slide_labels.get(r["slide_id"], 0) == 0)
+        fp = sum(1 for r in valid if r["answer"] == "A" and slide_labels.get(r["slide_id"], 0) == 0)
+
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
+        balanced_acc = (sensitivity + specificity) / 2
+
+        metrics["slide_level"] = {
+            "TP": tp, "FN": fn, "TN": tn, "FP": fp,
+            "sensitivity": sensitivity,
+            "specificity": specificity,
+            "balanced_accuracy": balanced_acc,
+        }
+
+    return metrics
+
+
+def print_metrics(metrics: dict) -> None:
+    print(f"\n{'='*60}")
+    print("METRICS")
+    print(f"{'='*60}")
+    print(f"  Coverage: {metrics['coverage']:.4f} ({metrics['valid_sets']}/{metrics['total_sets']})")
+    print(f"  Answer dist: {dict(metrics['answer_distribution'])}")
+
+    pl = metrics.get("patch_level", {})
+    if pl:
+        print(f"\n  Patch-level:")
+        print(f"    False tumor on mask-neg: {pl['false_tumor_on_neg']}/{pl['sets_with_only_mask_neg']}")
+        print(f"    Missed tumor on mask-pos: {pl['missed_tumor_on_pos']}/{pl['sets_with_mask_pos']}")
+        print(f"    Correct abstain on mixed: {pl['correct_abstain_on_mixed']}/{pl['mixed_sets']}")
+
+    sl = metrics.get("slide_level")
+    if sl:
+        print(f"\n  Slide-level:")
+        print(f"    TP={sl['TP']} FN={sl['FN']} TN={sl['TN']} FP={sl['FP']}")
+        print(f"    Sensitivity: {sl['sensitivity']:.4f}")
+        print(f"    Specificity: {sl['specificity']:.4f}")
+        print(f"    Balanced accuracy: {sl['balanced_accuracy']:.4f}")
+
+
+def save_results(results: list[dict], output_path: Path, output_s3_prefix: str) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    jsonl_path = output_path.with_suffix(".jsonl")
+    with jsonl_path.open("w", encoding="utf-8") as f:
+        for r in results:
+            f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+
+    summary = []
+    for r in results:
+        summary.append({
+            "patch_set_uid": r["patch_set_uid"],
+            "slide_id": r["slide_id"],
+            "patient_id": r["patient_id"],
+            "dataset": r["dataset"],
+            "selection_source": r["selection_source"],
+            "mode": r["mode"],
+            "answer": r["answer"],
+            "parse_valid": r["parse_valid"],
+            "n_patches": r["n_patches_shown"],
+            "error": r["error"],
+        })
+    summary_df = pd.DataFrame(summary)
+    csv_path = output_path.with_suffix(".csv")
+    summary_df.to_csv(csv_path, index=False)
+
+    for f in [jsonl_path, csv_path]:
+        s3_key = f"{output_s3_prefix}/{f.name}"
+        url = upload_to_s3(str(f), s3_key)
+        print(f"  Uploaded: {url}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="VLM inference pipeline")
+    parser.add_argument("--registry_csv", default=REGISTRY_CSV_DEFAULT)
+    parser.add_argument("--dataset", default="c16", choices=["c16", "c17", "c16_c17"])
+    parser.add_argument("--model", default="med_gemma")
+    parser.add_argument("--mode", default="context", choices=["single", "separate", "context"])
+    parser.add_argument("--source", default="top_k")
+    parser.add_argument("--n_patches", type=int, default=3)
+    parser.add_argument("--max_slides", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--repetition_penalty", type=float, default=1.0)
+    parser.add_argument("--max_new_tokens", type=int, default=128)
+    parser.add_argument("--load_4bit", action="store_true")
+    parser.add_argument("--cache_dir", default="/tmp/vlm_patch_cache")
+    parser.add_argument("--output", default="")
+    parser.add_argument("--output_s3", default="mil/vlm_results")
+    parser.add_argument("--only_metrics", default="",
+                        help="Load existing JSONL and recompute metrics")
+    args = parser.parse_args()
+
+    if args.dataset == "c16":
+        datasets = C16_DATASETS
+    elif args.dataset == "c17":
+        datasets = C17_DATASETS
+    else:
+        datasets = C16_DATASETS + C17_DATASETS
+
+    if args.only_metrics:
+        print(f"[pipeline] Loading existing results from {args.only_metrics}")
+        results = []
+        with open(args.only_metrics) as f:
+            for line in f:
+                if line.strip():
+                    results.append(json.loads(line))
+        metrics = compute_metrics(results)
+        print_metrics(metrics)
+        return 0
+
+    registry = load_registry(
+        args.registry_csv, datasets,
+        sources=None, max_slides=args.max_slides,
+    )
+
+    cache_dir = Path(args.cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    mod = importlib.import_module(f"vlm_backends.{args.model}")
+    backend_cls_name = {
+        "med_gemma": "MedGemmaBackend",
+        "med_siglip": "MedSigLIPBackend",
+        "quilt_llava": "QuiltLLaVABackend",
+    }.get(args.model)
+    if backend_cls_name is None:
+        print(f"[pipeline] Unknown model: {args.model}")
+        return 1
+    backend = getattr(mod, backend_cls_name)()
+
+    print(f"[pipeline] Loading model: {backend.model_id()}")
+    try:
+        backend.load(load_4bit=args.load_4bit)
+    except Exception as exc:
+        print(f"[pipeline] ERROR loading model: {exc}")
+        traceback.print_exc()
+        return 1
+
+    backend_config = backend.config_snapshot()
+    git_commit = _git_commit()
+
+    patch_sets = build_patch_sets(
+        registry, source=args.source,
+        n_patches=args.n_patches,
+    )
+    print(f"[pipeline] Built {len(patch_sets)} patch sets for source={args.source}")
+
+    results = run_inference(
+        backend=backend,
+        patch_sets=patch_sets,
+        mode=args.mode,
+        cache_dir=cache_dir,
+        seed=args.seed,
+        temperature=args.temperature,
+        repetition_penalty=args.repetition_penalty,
+        max_new_tokens=args.max_new_tokens,
+        backend_config=backend_config,
+        git_commit=git_commit,
+    )
+
+    metrics = compute_metrics(results)
+    print_metrics(metrics)
+
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        output_path = Path(tempfile.gettempdir()) / f"vlm_{args.dataset}_{args.model}_{args.mode}_{args.source}"
+
+    save_results(results, output_path, args.output_s3)
+
+    print(f"[pipeline] Done. {len(results)} results at {output_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

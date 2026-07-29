@@ -19,25 +19,13 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-_siglip_target_size: int = 896
-
-
-def _pad_to_siglip(img: Image.Image, target: int = _siglip_target_size) -> Image.Image:
-    w, h = img.size
-    if w == target and h == target:
-        return img
-    new = Image.new("RGB", (target, target), (0, 0, 0))
-    left = (target - w) // 2
-    top = (target - h) // 2
-    new.paste(img, (left, top))
-    return new
-
-
 class MedGemmaBackend(VLMBackend):
     def __init__(self) -> None:
         self._model = None
         self._processor = None
         self._device = None
+        self._revision = None
+        self._quantization = None
 
     @staticmethod
     def model_id() -> str:
@@ -64,7 +52,6 @@ class MedGemmaBackend(VLMBackend):
             revision=revision,
             token=True,
             trust_remote_code=True,
-            use_fast=True,
         )
 
         self._model = Gemma3ForConditionalGeneration.from_pretrained(
@@ -77,6 +64,15 @@ class MedGemmaBackend(VLMBackend):
         )
         self._model.eval()
         self._device = next(self._model.parameters()).device
+        self._revision = revision
+        self._quantization = "4bit-nf4-double" if load_4bit else "none"
+
+    def config_snapshot(self) -> dict:
+        return {
+            "model_id": self.model_id(),
+            "revision": self._revision,
+            "quantization": self._quantization,
+        }
 
     def generate(
         self,
@@ -90,42 +86,36 @@ class MedGemmaBackend(VLMBackend):
         if self._model is None or self._processor is None:
             raise RuntimeError("Model not loaded. Call load() first.")
 
-        padded = [_pad_to_siglip(img) for img in images]
-
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": img} for img in padded
+                    {"type": "image", "image": img} for img in images
                 ] + [
                     {"type": "text", "text": prompt}
                 ],
             }
         ]
 
-        model_inputs = self._processor.apply_chat_template(
+        prompt_text = self._processor.apply_chat_template(
             messages,
             add_generation_prompt=True,
-            tokenize=True,
+            tokenize=False,
+        )
+
+        inputs = self._processor(
+            text=prompt_text,
+            images=images,
             return_tensors="pt",
             padding=True,
         )
 
-        image_inputs = self._processor.image_processor(
-            padded,
-            return_tensors="pt",
-        )
+        inputs = inputs.to(self._model.device)
+        inputs.pop("token_type_ids", None)
 
-        model_inputs["pixel_values"] = image_inputs["pixel_values"]
-        if "pixel_attention_mask" in image_inputs:
-            model_inputs["pixel_attention_mask"] = image_inputs["pixel_attention_mask"]
-
-        model_inputs = model_inputs.to(self._model.device)
         for key in ("pixel_values", "pixel_attention_mask"):
-            if key in model_inputs:
-                model_inputs[key] = model_inputs[key].to(dtype=torch.float16)
-
-        model_inputs.pop("token_type_ids", None)
+            if key in inputs and inputs[key].dtype != torch.float16:
+                inputs[key] = inputs[key].to(dtype=torch.float16)
 
         if seed is not None:
             set_seed(seed)
@@ -143,9 +133,9 @@ class MedGemmaBackend(VLMBackend):
             gen_kwargs["repetition_penalty"] = float(repetition_penalty)
 
         with torch.inference_mode():
-            output_ids = self._model.generate(**model_inputs, **gen_kwargs)
+            output_ids = self._model.generate(**inputs, **gen_kwargs)
 
-        input_len = model_inputs["input_ids"].shape[1]
+        input_len = inputs["input_ids"].shape[1]
         new_tokens = output_ids[:, input_len:]
         decoded = self._processor.batch_decode(
             new_tokens, skip_special_tokens=True

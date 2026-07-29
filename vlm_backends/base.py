@@ -27,3 +27,6 @@ class VLMBackend(abc.ABC):
         seed: Optional[int] = None,
     ) -> str:
         ...
+
+    def config_snapshot(self) -> dict:
+        return {"model_id": self.model_id(), "revision": None, "quantization": None}
