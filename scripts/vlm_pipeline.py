@@ -411,106 +411,135 @@ def run_inference(
     return all_records
 
 
-def compute_metrics(results: list[dict], slide_labels: dict[str, int] | None = None) -> dict:
-    """Two-level metrics.
+def _per_set_ground_truth(r: dict) -> int:
+    return 1 if any(
+        p.get("tumor_mask_overlap") == 1 for p in r["patches"].values()
+    ) else 0
 
-    Level 1 — slide-level (if slide_labels provided):
-      sens, spec, balanced_acc, top_k vs random advantage
 
-    Level 2 — patch-level (always):
-      false tumor on mask-neg, missed tumor on mask-pos,
-      correct abstention, coverage
-    """
-    metrics = {}
+def compute_metrics(
+    results: list[dict],
+    slide_labels: dict[str, int] | None = None,
+) -> dict:
+    metrics = {"total_sets": len(results)}
 
     valid = [r for r in results if r["parse_valid"]]
-    metrics["total_sets"] = len(results)
     metrics["valid_sets"] = len(valid)
     metrics["coverage"] = len(valid) / max(len(results), 1)
 
-    ans_counts = defaultdict(int)
-    for r in valid:
-        ans_counts[r["answer"]] += 1
-    metrics["answer_distribution"] = dict(ans_counts)
+    if not valid:
+        return metrics
 
-    pos_patches = 0
-    neg_patches = 0
-    false_tumor = 0
-    missed_tumor = 0
-    correct_abstain = 0
-    mixed_total = 0
+    source = valid[0]["selection_source"]
+    mode = valid[0]["mode"]
+    dataset = valid[0]["dataset"]
+    metrics["source"] = source
+    metrics["mode"] = mode
+    metrics["dataset"] = dataset
 
-    for r in valid:
-        patch_masks = [
-            p.get("tumor_mask_overlap", -1)
-            for p in r["patches"].values()
-        ]
-        has_pos = any(m == 1 for m in patch_masks)
-        has_neg = any(m == 0 for m in patch_masks)
+    a = sum(1 for r in valid if r["answer"] == "A")
+    b = sum(1 for r in valid if r["answer"] == "B")
+    c = sum(1 for r in valid if r["answer"] == "C")
+    total = a + b + c
+    metrics["A"] = a
+    metrics["B"] = b
+    metrics["C"] = c
 
-        if has_pos:
-            pos_patches += 1
-            if r["answer"] in ("B", "C"):
-                missed_tumor += 1
-        if has_neg and not has_pos:
-            neg_patches += 1
-            if r["answer"] == "A":
-                false_tumor += 1
-        if has_pos and has_neg:
-            mixed_total += 1
-            if r["answer"] == "C":
-                correct_abstain += 1
+    if source == "oracle_tumor":
+        metrics["sensitivity"] = a / total if total else float("nan")
+        metrics["specificity"] = float("nan")
 
-    metrics["patch_level"] = {
-        "sets_with_mask_pos": pos_patches,
-        "sets_with_only_mask_neg": neg_patches,
-        "false_tumor_on_neg": false_tumor,
-        "missed_tumor_on_pos": missed_tumor,
-        "mixed_sets": mixed_total,
-        "correct_abstain_on_mixed": correct_abstain,
-    }
+    elif source in ("oracle_non_tumor", "hard_negative"):
+        metrics["sensitivity"] = float("nan")
+        metrics["specificity"] = b / total if total else float("nan")
+
+    elif source == "top_k":
+        tp = fn = tn = fp = 0
+        for r in valid:
+            gt = _per_set_ground_truth(r)
+            ans = r["answer"]
+            if gt == 1 and ans == "A":
+                tp += 1
+            elif gt == 1 and ans in ("B", "C"):
+                fn += 1
+            elif gt == 0 and ans == "B":
+                tn += 1
+            elif gt == 0 and ans == "A":
+                fp += 1
+        sens = tp / (tp + fn) if (tp + fn) else float("nan")
+        spec = tn / (tn + fp) if (tn + fp) else float("nan")
+        metrics["TP"] = tp
+        metrics["FN"] = fn
+        metrics["TN"] = tn
+        metrics["FP"] = fp
+        metrics["sensitivity"] = sens
+        metrics["specificity"] = spec
+        metrics["accuracy"] = (tp + tn) / max(tp + fn + tn + fp, 1)
+
+    else:
+        metrics["sensitivity"] = float("nan")
+        metrics["specificity"] = float("nan")
 
     if slide_labels:
-        tp = sum(1 for r in valid if r["answer"] == "A" and slide_labels.get(r["slide_id"], 0) == 1)
-        fn = sum(1 for r in valid if r["answer"] in ("B", "C") and slide_labels.get(r["slide_id"], 0) == 1)
-        tn = sum(1 for r in valid if r["answer"] == "B" and slide_labels.get(r["slide_id"], 0) == 0)
-        fp = sum(1 for r in valid if r["answer"] == "A" and slide_labels.get(r["slide_id"], 0) == 0)
-
-        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
-        balanced_acc = (sensitivity + specificity) / 2
-
+        slide_preds: dict[str, list[str]] = defaultdict(list)
+        for r in valid:
+            slide_preds[r["slide_id"]].append(r["answer"])
+        tp = fn = tn = fp = 0
+        for slide_id, answers in slide_preds.items():
+            gt = slide_labels.get(slide_id, 0)
+            any_a = any(a == "A" for a in answers)
+            if gt == 1 and any_a:
+                tp += 1
+            elif gt == 1 and not any_a:
+                fn += 1
+            elif gt == 0 and not any_a:
+                tn += 1
+            elif gt == 0 and any_a:
+                fp += 1
+        sens = tp / (tp + fn) if (tp + fn) else float("nan")
+        spec = tn / (tn + fp) if (tn + fp) else float("nan")
         metrics["slide_level"] = {
             "TP": tp, "FN": fn, "TN": tn, "FP": fp,
-            "sensitivity": sensitivity,
-            "specificity": specificity,
-            "balanced_accuracy": balanced_acc,
+            "sensitivity": sens,
+            "specificity": spec,
+            "balanced_accuracy": (sens + spec) / 2,
         }
 
     return metrics
 
 
 def print_metrics(metrics: dict) -> None:
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print("METRICS")
-    print(f"{'='*60}")
+    print(f"{'='*70}")
     print(f"  Coverage: {metrics['coverage']:.4f} ({metrics['valid_sets']}/{metrics['total_sets']})")
-    print(f"  Answer dist: {dict(metrics['answer_distribution'])}")
 
-    pl = metrics.get("patch_level", {})
-    if pl:
-        print(f"\n  Patch-level:")
-        print(f"    False tumor on mask-neg: {pl['false_tumor_on_neg']}/{pl['sets_with_only_mask_neg']}")
-        print(f"    Missed tumor on mask-pos: {pl['missed_tumor_on_pos']}/{pl['sets_with_mask_pos']}")
-        print(f"    Correct abstain on mixed: {pl['correct_abstain_on_mixed']}/{pl['mixed_sets']}")
+    a = metrics.get("A", 0)
+    b = metrics.get("B", 0)
+    c = metrics.get("C", 0)
+    total = a + b + c
+    sens = metrics.get("sensitivity", float("nan"))
+    spec = metrics.get("specificity", float("nan"))
+    acc = metrics.get("accuracy", float("nan"))
+    src = metrics.get("source", "?")
+    md = metrics.get("mode", "?")
+    ds = metrics.get("dataset", "?")
+
+    s = f"{sens:.3f}" if not np.isnan(sens) else " n/a"
+    sp = f"{spec:.3f}" if not np.isnan(spec) else " n/a"
+    ac = f"{acc:.3f}" if not np.isnan(acc) else " n/a"
+
+    print(f"  {ds:<20} {src:<16} {md:<10} A={a:>4} B={b:>4} C={c:>4} Total={total:>4}  "
+          f"Sens={s}  Spec={sp}  Acc={ac}")
 
     sl = metrics.get("slide_level")
     if sl:
-        print(f"\n  Slide-level:")
+        print(f"  Slide-level (any A = tumor):")
         print(f"    TP={sl['TP']} FN={sl['FN']} TN={sl['TN']} FP={sl['FP']}")
-        print(f"    Sensitivity: {sl['sensitivity']:.4f}")
-        print(f"    Specificity: {sl['specificity']:.4f}")
-        print(f"    Balanced accuracy: {sl['balanced_accuracy']:.4f}")
+        ss = f"{sl['sensitivity']:.3f}" if not np.isnan(sl['sensitivity']) else "n/a"
+        sp = f"{sl['specificity']:.3f}" if not np.isnan(sl['specificity']) else "n/a"
+        ba = f"{sl['balanced_accuracy']:.3f}" if not np.isnan(sl['balanced_accuracy']) else "n/a"
+        print(f"    Sensitivity: {ss}  Specificity: {sp}  Balanced acc: {ba}")
 
 
 def save_results(results: list[dict], output_path: Path, output_s3_prefix: str) -> None:
@@ -569,8 +598,6 @@ def main() -> int:
     parser.add_argument("--cache_dir", default="/tmp/vlm_patch_cache")
     parser.add_argument("--output", default="")
     parser.add_argument("--output_s3", default="mil/vlm_results")
-    parser.add_argument("--only_metrics", default="",
-                        help="Load existing JSONL and recompute metrics")
     args = parser.parse_args()
     load_4bit = args.four_bit
 
@@ -584,23 +611,29 @@ def main() -> int:
     sources = SOURCES_ALL if args.source == "all" else [args.source]
     modes = MODES_ALL if args.mode == "all" else [args.mode]
 
-    if args.only_metrics:
-        print(f"[pipeline] Loading existing results from {args.only_metrics}")
-        results = []
-        with open(args.only_metrics) as f:
-            for line in f:
-                if line.strip():
-                    results.append(json.loads(line))
-        metrics = compute_metrics(results)
-        print_metrics(metrics)
-        return 0
-
     _test_s3_access()
 
     registry = load_registry(
         args.registry_csv, datasets,
         sources=None, max_slides=args.max_slides,
     )
+
+    slide_labels: dict[str, int] = {}
+    if args.registry_csv.startswith("s3://") and len(registry) > 0:
+        first = registry.iloc[0]
+        minio_path = str(first.get("minio_path", ""))
+        m = re.search(r'(\w+)_vlm_patches_([a-f0-9]+)\.tar\.gz', minio_path)
+        if m:
+            prefix = m.group(1)
+            task_id = m.group(2)
+            meta_key = f"mil/vlm_patches/{prefix}_vlm_metadata_{task_id}.csv"
+            try:
+                meta_df = read_csv_from_s3(meta_key)
+                slide_labels = meta_df.groupby("slide_id")["label"].max().to_dict()
+                n_tumor = sum(1 for v in slide_labels.values() if v == 1)
+                print(f"  Loaded metadata: {len(slide_labels)} slides ({n_tumor} tumor, {len(slide_labels) - n_tumor} normal)")
+            except Exception as exc:
+                print(f"  WARNING: metadata not loaded ({exc})")
 
     cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -633,40 +666,48 @@ def main() -> int:
     git_commit = _git_commit()
     all_results = []
 
-    for src in sources:
+    for ds in datasets:
+        ds_registry = registry[registry["dataset"] == ds]
+        if ds_registry.empty:
+            continue
+
         print(f"\n{'='*60}")
-        print(f"SOURCE: {src}")
+        print(f"DATASET: {ds} ({len(ds_registry)} entries)")
         print(f"{'='*60}")
 
-        patch_sets = build_patch_sets(
-            registry, source=src, n_patches=args.n_patches,
-        )
-        print(f"  Patch sets built: {len(patch_sets)}")
+        for src in sources:
+            print(f"\n  SOURCE: {src}")
+            print(f"  {'-'*40}")
 
-        for mode in modes:
-            print(f"\n  --- Mode: {mode} ---")
-            label = f"{src}/{mode}"
-
-            results = run_inference(
-                backend=backend,
-                patch_sets=patch_sets,
-                mode=mode,
-                cache_dir=cache_dir,
-                seed=args.seed,
-                temperature=args.temperature,
-                repetition_penalty=args.repetition_penalty,
-                max_new_tokens=args.max_new_tokens,
-                backend_config=backend_config,
-                git_commit=git_commit,
+            patch_sets = build_patch_sets(
+                ds_registry, source=src, n_patches=args.n_patches,
             )
+            print(f"  Patch sets built: {len(patch_sets)}")
 
-            metrics = compute_metrics(results)
-            print(f"  Metrics for {label}:")
-            print_metrics(metrics)
+            for mode in modes:
+                print(f"\n    --- Mode: {mode} ---")
+                label = f"{ds}/{src}/{mode}"
 
-            for r in results:
-                r["run_label"] = label
-                all_results.append(r)
+                results = run_inference(
+                    backend=backend,
+                    patch_sets=patch_sets,
+                    mode=mode,
+                    cache_dir=cache_dir,
+                    seed=args.seed,
+                    temperature=args.temperature,
+                    repetition_penalty=args.repetition_penalty,
+                    max_new_tokens=args.max_new_tokens,
+                    backend_config=backend_config,
+                    git_commit=git_commit,
+                )
+
+                metrics = compute_metrics(results, slide_labels=slide_labels)
+                print(f"    Metrics for {label}:")
+                print_metrics(metrics)
+
+                for r in results:
+                    r["run_label"] = label
+                    all_results.append(r)
 
     if not all_results:
         print("[pipeline] No results produced.")
