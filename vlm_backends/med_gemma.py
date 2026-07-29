@@ -82,10 +82,11 @@ class MedGemmaBackend(VLMBackend):
         self._quantization = "4bit-nf4-double" if load_4bit else "none"
 
         proc_id = self._processor.image_token_id
-        model_id = self._model.config.image_token_id
+        model_id = getattr(self._model.config, 'image_token_index',
+                   getattr(self._model.config, 'image_token_id', None))
         if proc_id != model_id:
             print(f"[med_gemma] Aligning image_token_id: processor={proc_id} model={model_id} -> {proc_id}")
-            self._model.config.image_token_id = proc_id
+            self._model.config.image_token_index = proc_id
 
     def config_snapshot(self) -> dict:
         return {
@@ -150,7 +151,8 @@ class MedGemmaBackend(VLMBackend):
             if key in model_inputs:
                 model_inputs[key] = model_inputs[key].to(dtype=torch.float16)
 
-        img_tok_id = self._model.config.image_token_id
+        img_tok_id = getattr(self._model.config, 'image_token_index',
+                     getattr(self._model.config, 'image_token_id', None))
         n_img = (model_inputs["input_ids"] == img_tok_id).sum().item()
         print(f"[med_gemma] image_token_id={img_tok_id}, count in input_ids={n_img}")
         print(f"[med_gemma] pixel_values final: {model_inputs['pixel_values'].dtype}, {model_inputs['pixel_values'].shape}")
