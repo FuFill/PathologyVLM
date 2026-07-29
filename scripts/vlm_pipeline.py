@@ -173,6 +173,18 @@ def _patch_set_uid(patches: list[dict]) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+def _test_s3_access():
+    from src.s3_utils import get_s3_client
+    client = get_s3_client()
+    key = "Pathomorphology/CAMELYON/mil/vlm_patches_registry/patch_registry.csv"
+    try:
+        client.head_object(Bucket="pershin-medailab", Key=key)
+        print("[pipeline] S3 access OK")
+    except Exception as exc:
+        print(f"[pipeline] S3 access FAILED: {exc}")
+        raise
+
+
 def load_registry(
     csv_path: str,
     datasets: tuple[str, ...],
@@ -578,6 +590,8 @@ def main() -> int:
         metrics = compute_metrics(results)
         print_metrics(metrics)
         return 0
+
+    _test_s3_access()
 
     registry = load_registry(
         args.registry_csv, datasets,
