@@ -286,10 +286,6 @@ def run_inference(
         source = patches[0].get("selection_source", "unknown")
         group = f"{slide_id}/{source}"
 
-        if idx % 10 == 0:
-            elapsed = time.time() - t0
-            print(f"  [{idx}/{total}] {group} ({elapsed:.0f}s)")
-
         set_id = _patch_set_uid(patches)
 
         pil_images: list[Image.Image] = []
@@ -374,6 +370,9 @@ def run_inference(
             traceback.print_exc()
             aggregate = ""
             parse_valid = False
+
+        elapsed = time.time() - t0
+        print(f"  [{idx}/{total}] {group}/{mode} → {aggregate} ({elapsed:.0f}s)")
 
         record = {
             "patch_set_uid": set_id,
