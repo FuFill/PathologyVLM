@@ -102,6 +102,7 @@ class MedGemmaBackend(VLMBackend):
             add_generation_prompt=True,
             tokenize=False,
         )
+        print(f"[med_gemma] prompt_text:\n{prompt_text}")
 
         inputs = self._processor(
             text=prompt_text,
@@ -109,6 +110,14 @@ class MedGemmaBackend(VLMBackend):
             return_tensors="pt",
             padding=True,
         )
+        print(f"[med_gemma] inputs keys: {list(inputs.keys())}")
+        print(f"[med_gemma] input_ids shape: {inputs['input_ids'].shape}")
+        print(f"[med_gemma] input_ids decoded:\n{self._processor.tokenizer.decode(inputs['input_ids'][0])}")
+        if "pixel_values" in inputs:
+            pv = inputs["pixel_values"]
+            print(f"[med_gemma] pixel_values shape: {pv.shape}, dtype: {pv.dtype}")
+        if "pixel_attention_mask" in inputs:
+            print(f"[med_gemma] pixel_attention_mask shape: {inputs['pixel_attention_mask'].shape}")
 
         inputs = inputs.to(self._model.device)
         inputs.pop("token_type_ids", None)
@@ -134,11 +143,13 @@ class MedGemmaBackend(VLMBackend):
 
         with torch.inference_mode():
             output_ids = self._model.generate(**inputs, **gen_kwargs)
-
+        print(f"[med_gemma] output_ids shape: {output_ids.shape}")
         input_len = inputs["input_ids"].shape[1]
         new_tokens = output_ids[:, input_len:]
+        print(f"[med_gemma] new_tokens shape: {new_tokens.shape}")
+        print(f"[med_gemma] new_tokens ids: {new_tokens.tolist()}")
         decoded = self._processor.batch_decode(
             new_tokens, skip_special_tokens=True
         )[0]
-
+        print(f"[med_gemma] decoded: |{decoded}|")
         return decoded.strip()
