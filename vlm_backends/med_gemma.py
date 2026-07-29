@@ -155,7 +155,29 @@ class MedGemmaBackend(VLMBackend):
                      getattr(self._model.config, 'image_token_id', None))
         n_img = (model_inputs["input_ids"] == img_tok_id).sum().item()
         print(f"[med_gemma] image_token_id={img_tok_id}, count in input_ids={n_img}")
-        print(f"[med_gemma] pixel_values final: {model_inputs['pixel_values'].dtype}, {model_inputs['pixel_values'].shape}")
+
+        pv = model_inputs["pixel_values"]
+        print(f"[med_gemma] pixel_values: dtype={pv.dtype}, shape={pv.shape}, "
+              f"min={pv.min().item():.4f}, max={pv.max().item():.4f}, "
+              f"mean={pv.mean().item():.4f}, std={pv.std().item():.4f}")
+
+        proj = self._model.model.multi_modal_projector.mm_input_projection_weight
+        print(f"[med_gemma] projector weight: dtype={proj.dtype}, shape={proj.shape}, "
+              f"min={proj.min().item():.6f}, max={proj.max().item():.6f}, "
+              f"mean={proj.mean().item():.6f}")
+
+        with torch.inference_mode():
+            img_feat = self._model.get_image_features(
+                pixel_values=model_inputs["pixel_values"]
+            ).pooler_output
+            print(f"[med_gemma] image_features: dtype={img_feat.dtype}, shape={img_feat.shape}, "
+                  f"min={img_feat.min().item():.4f}, max={img_feat.max().item():.4f}, "
+                  f"mean={img_feat.mean().item():.4f}, has_nan={torch.isnan(img_feat).any().item()}")
+
+        input_embeds = self._model.model.get_input_embeddings()(model_inputs["input_ids"])
+        print(f"[med_gemma] input_embeds before masked_scatter: "
+              f"min={input_embeds.min().item():.4f}, max={input_embeds.max().item():.4f}, "
+              f"mean={input_embeds.mean().item():.4f}")
 
         if seed is not None:
             set_seed(seed)
