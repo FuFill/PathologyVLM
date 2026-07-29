@@ -40,7 +40,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.s3_utils import get_minio_path_components, get_s3_client, upload_to_s3
+from src.s3_utils import (
+    get_minio_path_components,
+    get_s3_client,
+    read_csv_from_s3,
+    upload_to_s3,
+)
 
 REGISTRY_CSV_DEFAULT = (
     "s3://pershin-medailab/Pathomorphology/CAMELYON/"
@@ -161,16 +166,6 @@ def _load_image(path: Path) -> Optional[Image.Image]:
         return None
 
 
-def _read_registry_s3(s3_path: str) -> pd.DataFrame:
-    parts = s3_path.replace("s3://", "", 1).split("/", 1)
-    if len(parts) != 2:
-        raise ValueError(f"Invalid S3 path: {s3_path}")
-    bucket, key = parts
-    client = get_s3_client()
-    obj = client.get_object(Bucket=bucket, Key=key)
-    return pd.read_csv(io.BytesIO(obj["Body"].read()))
-
-
 def _patch_set_uid(patches: list[dict]) -> str:
     raw = "|".join(
         str(p.get("region_uid", p.get("patch_uid", ""))) for p in patches
@@ -184,9 +179,10 @@ def load_registry(
     sources: tuple[str, ...] | None,
     max_slides: int = 0,
 ) -> pd.DataFrame:
+    s3_registry_key = "mil/vlm_patches_registry/patch_registry.csv"
     if csv_path.startswith("s3://"):
-        print(f"[pipeline] Loading registry from S3: {csv_path}")
-        df = _read_registry_s3(csv_path)
+        print(f"[pipeline] Loading registry from S3 via read_csv_from_s3")
+        df = read_csv_from_s3(s3_registry_key)
     else:
         print(f"[pipeline] Loading registry: {csv_path}")
         df = pd.read_csv(csv_path)
