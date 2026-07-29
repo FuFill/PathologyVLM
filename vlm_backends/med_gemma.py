@@ -76,7 +76,7 @@ class MedGemmaBackend(VLMBackend):
         self._model = Gemma3ForConditionalGeneration.from_pretrained(
             self.model_id(),
             revision=revision,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16,
             device_map="auto" if torch.cuda.is_available() else None,
             quantization_config=quantization_config,
             token=True,
@@ -159,7 +159,7 @@ class MedGemmaBackend(VLMBackend):
         model_inputs = model_inputs.to(self._model.device)
         for key in ("pixel_values", "pixel_attention_mask"):
             if key in model_inputs:
-                model_inputs[key] = model_inputs[key].to(dtype=torch.float16)
+                model_inputs[key] = model_inputs[key].to(dtype=torch.bfloat16)
 
         img_tok_id = getattr(self._model.config, 'image_token_index',
                      getattr(self._model.config, 'image_token_id', None))
