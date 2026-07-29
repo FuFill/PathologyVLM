@@ -161,17 +161,14 @@ def _load_image(path: Path) -> Optional[Image.Image]:
         return None
 
 
-def _resolve_registry_csv(path: str) -> str:
-    if path.startswith("s3://"):
-        parts = path.replace("s3://", "", 1).split("/", 1)
-        if len(parts) == 2:
-            bucket, key = parts
-            client = get_s3_client()
-            tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
-            client.download_file(bucket, key, tmp.name)
-            print(f"[pipeline] Downloaded registry to {tmp.name}")
-            return tmp.name
-    return path
+def _read_registry_s3(s3_path: str) -> pd.DataFrame:
+    parts = s3_path.replace("s3://", "", 1).split("/", 1)
+    if len(parts) != 2:
+        raise ValueError(f"Invalid S3 path: {s3_path}")
+    bucket, key = parts
+    client = get_s3_client()
+    obj = client.get_object(Bucket=bucket, Key=key)
+    return pd.read_csv(io.BytesIO(obj["Body"].read()))
 
 
 def _patch_set_uid(patches: list[dict]) -> str:
@@ -187,9 +184,12 @@ def load_registry(
     sources: tuple[str, ...] | None,
     max_slides: int = 0,
 ) -> pd.DataFrame:
-    path = _resolve_registry_csv(csv_path)
-    print(f"[pipeline] Loading registry: {path}")
-    df = pd.read_csv(path)
+    if csv_path.startswith("s3://"):
+        print(f"[pipeline] Loading registry from S3: {csv_path}")
+        df = _read_registry_s3(csv_path)
+    else:
+        print(f"[pipeline] Loading registry: {csv_path}")
+        df = pd.read_csv(csv_path)
     print(f"  Total: {len(df)} entries")
 
     df = df[df["dataset"].isin(datasets)]
