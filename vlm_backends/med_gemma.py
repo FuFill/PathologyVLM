@@ -176,7 +176,9 @@ class MedGemmaBackend(VLMBackend):
         with torch.inference_mode():
             img_feat = self._model.get_image_features(
                 pixel_values=model_inputs["pixel_values"]
-            ).pooler_output
+            )
+            if hasattr(img_feat, 'pooler_output'):
+                img_feat = img_feat.pooler_output
             print(f"[med_gemma] image_features: dtype={img_feat.dtype}, shape={img_feat.shape}, "
                   f"min={img_feat.min().item():.4f}, max={img_feat.max().item():.4f}, "
                   f"mean={img_feat.mean().item():.4f}, has_nan={torch.isnan(img_feat).any().item()}")
