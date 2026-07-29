@@ -88,6 +88,18 @@ class MedGemmaBackend(VLMBackend):
             print(f"[med_gemma] Aligning image_token_id: processor={proc_id} model={model_id} -> {proc_id}")
             self._model.config.image_token_index = proc_id
 
+        embed_weight = self._model.get_input_embeddings().weight
+        lm_head = self._model.lm_head
+        print(f"[med_gemma] embed.weight: shape={list(embed_weight.shape)}, "
+              f"min={embed_weight.min().item():.4f}, max={embed_weight.max().item():.4f}, "
+              f"mean={embed_weight.mean().item():.4f}")
+        print(f"[med_gemma] lm_head.weight: shape={list(lm_head.weight.shape)}, "
+              f"min={lm_head.weight.min().item():.4f}, max={lm_head.weight.max().item():.4f}, "
+              f"mean={lm_head.weight.mean().item():.4f}")
+        if lm_head.weight.shape == embed_weight.shape:
+            lm_head.weight.data.copy_(embed_weight.data)
+            print("[med_gemma] Manually tied lm_head.weight <- embed.weight")
+
     def config_snapshot(self) -> dict:
         return {
             "model_id": self.model_id(),
@@ -143,6 +155,8 @@ class MedGemmaBackend(VLMBackend):
         model_inputs["pixel_values"] = image_inputs["pixel_values"]
         if "pixel_attention_mask" in image_inputs:
             model_inputs["pixel_attention_mask"] = image_inputs["pixel_attention_mask"]
+
+        model_inputs.pop("token_type_ids", None)
 
         model_inputs = model_inputs.to(self._model.device)
         for key in ("pixel_values", "pixel_attention_mask"):
