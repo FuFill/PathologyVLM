@@ -144,8 +144,6 @@ class MedGemmaBackend(VLMBackend):
         if "pixel_attention_mask" in image_inputs:
             model_inputs["pixel_attention_mask"] = image_inputs["pixel_attention_mask"]
 
-        model_inputs.pop("token_type_ids", None)
-
         model_inputs = model_inputs.to(self._model.device)
         for key in ("pixel_values", "pixel_attention_mask"):
             if key in model_inputs:
