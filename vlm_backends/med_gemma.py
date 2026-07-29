@@ -113,15 +113,22 @@ class MedGemmaBackend(VLMBackend):
             }
         ]
 
-        model_inputs = self._processor.tokenizer.apply_chat_template(
+        input_ids = self._processor.tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
             tokenize=True,
             return_tensors="pt",
             padding=True,
         )
-        print(f"[med_gemma] input_ids shape: {model_inputs['input_ids'].shape}")
-        print(f"[med_gemma] input_ids decoded:\n{self._processor.tokenizer.decode(model_inputs['input_ids'][0])}")
+        print(f"[med_gemma] input_ids type: {type(input_ids).__name__}")
+        if isinstance(input_ids, dict):
+            print(f"[med_gemma] input_ids keys: {list(input_ids.keys())}")
+            ids_tensor = input_ids["input_ids"]
+        else:
+            print(f"[med_gemma] input_ids is tensor, shape: {input_ids.shape}")
+            ids_tensor = input_ids
+
+        print(f"[med_gemma] input_ids decoded:\n{self._processor.tokenizer.decode(ids_tensor[0])}")
 
         image_inputs = self._processor.image_processor(
             padded,
@@ -129,16 +136,17 @@ class MedGemmaBackend(VLMBackend):
         )
         print(f"[med_gemma] pixel_values shape: {image_inputs['pixel_values'].shape}, dtype: {image_inputs['pixel_values'].dtype}")
 
-        model_inputs["pixel_values"] = image_inputs["pixel_values"]
+        model_inputs: dict = {
+            "input_ids": ids_tensor.to(self._model.device),
+            "attention_mask": torch.ones_like(ids_tensor, device=self._model.device),
+            "pixel_values": image_inputs["pixel_values"].to(
+                device=self._model.device, dtype=torch.float16
+            ),
+        }
         if "pixel_attention_mask" in image_inputs:
-            model_inputs["pixel_attention_mask"] = image_inputs["pixel_attention_mask"]
-
-        model_inputs = model_inputs.to(self._model.device)
-        for key in ("pixel_values", "pixel_attention_mask"):
-            if key in model_inputs:
-                model_inputs[key] = model_inputs[key].to(dtype=torch.float16)
-
-        model_inputs.pop("token_type_ids", None)
+            model_inputs["pixel_attention_mask"] = image_inputs["pixel_attention_mask"].to(
+                device=self._model.device, dtype=torch.float16
+            )
 
         if seed is not None:
             set_seed(seed)
