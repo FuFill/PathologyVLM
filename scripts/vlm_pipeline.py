@@ -560,15 +560,15 @@ def main() -> int:
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
     parser.add_argument("--max_new_tokens", type=int, default=128)
-    parser.add_argument("--no_4bit", action="store_true",
-                        help="Disable 4-bit quantization (default: 4-bit enabled)")
+    parser.add_argument("--4bit", action="store_true", dest="four_bit",
+                        help="Enable 4-bit quantization (default: float16)")
     parser.add_argument("--cache_dir", default="/tmp/vlm_patch_cache")
     parser.add_argument("--output", default="")
     parser.add_argument("--output_s3", default="mil/vlm_results")
     parser.add_argument("--only_metrics", default="",
                         help="Load existing JSONL and recompute metrics")
     args = parser.parse_args()
-    load_4bit = not args.no_4bit
+    load_4bit = args.four_bit
 
     if args.dataset == "c16":
         datasets = C16_DATASETS
