@@ -161,10 +161,17 @@ class MedGemmaBackend(VLMBackend):
               f"min={pv.min().item():.4f}, max={pv.max().item():.4f}, "
               f"mean={pv.mean().item():.4f}, std={pv.std().item():.4f}")
 
-        proj = self._model.model.multi_modal_projector.mm_input_projection_weight
-        print(f"[med_gemma] projector weight: dtype={proj.dtype}, shape={proj.shape}, "
-              f"min={proj.min().item():.6f}, max={proj.max().item():.6f}, "
-              f"mean={proj.mean().item():.6f}")
+        proj = None
+        for _name, _mod in self._model.named_modules():
+            if hasattr(_mod, 'mm_input_projection_weight'):
+                proj = _mod.mm_input_projection_weight
+                break
+        if proj is not None:
+            print(f"[med_gemma] projector weight from '{_name}': dtype={proj.dtype}, shape={proj.shape}, "
+                  f"min={proj.min().item():.6f}, max={proj.max().item():.6f}, "
+                  f"mean={proj.mean().item():.6f}")
+        else:
+            print("[med_gemma] projector weight NOT FOUND")
 
         with torch.inference_mode():
             img_feat = self._model.get_image_features(
@@ -174,7 +181,7 @@ class MedGemmaBackend(VLMBackend):
                   f"min={img_feat.min().item():.4f}, max={img_feat.max().item():.4f}, "
                   f"mean={img_feat.mean().item():.4f}, has_nan={torch.isnan(img_feat).any().item()}")
 
-        input_embeds = self._model.model.get_input_embeddings()(model_inputs["input_ids"])
+        input_embeds = self._model.get_input_embeddings()(model_inputs["input_ids"])
         print(f"[med_gemma] input_embeds before masked_scatter: "
               f"min={input_embeds.min().item():.4f}, max={input_embeds.max().item():.4f}, "
               f"mean={input_embeds.mean().item():.4f}")
