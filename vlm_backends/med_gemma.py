@@ -2,10 +2,15 @@ from __future__ import annotations
 
 from typing import Optional
 
+import sys
 import torch
 from PIL import Image
 
 from .base import VLMBackend
+
+
+def _dbg(*args, **kwargs):
+    print("[med_gemma]", *args, file=sys.stderr, **kwargs)
 
 
 def set_seed(seed: int) -> None:
@@ -85,20 +90,24 @@ class MedGemmaBackend(VLMBackend):
         model_id = getattr(self._model.config, 'image_token_index',
                    getattr(self._model.config, 'image_token_id', None))
         if proc_id != model_id:
-            print(f"[med_gemma] Aligning image_token_id: processor={proc_id} model={model_id} -> {proc_id}")
+            _dbg(f"Aligning image_token_id: processor={proc_id} model={model_id} -> {proc_id}")
             self._model.config.image_token_index = proc_id
 
         embed_weight = self._model.get_input_embeddings().weight
-        lm_head = self._model.lm_head
-        print(f"[med_gemma] embed.weight: shape={list(embed_weight.shape)}, "
-              f"min={embed_weight.min().item():.4f}, max={embed_weight.max().item():.4f}, "
-              f"mean={embed_weight.mean().item():.4f}")
-        print(f"[med_gemma] lm_head.weight: shape={list(lm_head.weight.shape)}, "
-              f"min={lm_head.weight.min().item():.4f}, max={lm_head.weight.max().item():.4f}, "
-              f"mean={lm_head.weight.mean().item():.4f}")
-        if lm_head.weight.shape == embed_weight.shape:
-            lm_head.weight.data.copy_(embed_weight.data)
-            print("[med_gemma] Manually tied lm_head.weight <- embed.weight")
+        _dbg(f"embed.weight: shape={list(embed_weight.shape)}, "
+             f"min={embed_weight.min().item():.4f}, max={embed_weight.max().item():.4f}, "
+             f"mean={embed_weight.mean().item():.4f}")
+
+        lang = getattr(self._model, 'language_model', None)
+        if lang is not None and hasattr(lang, 'lm_head'):
+            lm_head = lang.lm_head
+            _dbg(f"lm_head.weight (via language_model): shape={list(lm_head.weight.shape)}, "
+                 f"min={lm_head.weight.min().item():.4f}, max={lm_head.weight.max().item():.4f}, "
+                 f"mean={lm_head.weight.mean().item():.4f}")
+            tied = lm_head.weight.data_ptr() == embed_weight.data_ptr()
+            _dbg(f"lm_head tied to embed: {tied}")
+        else:
+            _dbg(f"WARNING: language_model.lm_head not found (attrs: {[a for a in dir(self._model) if not a.startswith('_')]})")
 
     def config_snapshot(self) -> dict:
         return {
@@ -132,31 +141,20 @@ class MedGemmaBackend(VLMBackend):
             }
         ]
 
-        model_inputs = self._processor.apply_chat_template(
+        formatted_text = self._processor.apply_chat_template(
             messages,
             add_generation_prompt=True,
-            tokenize=True,
+            tokenize=False,
+        )
+        _dbg(f"formatted_text (first 150): {formatted_text[:150]!r}")
+
+        model_inputs = self._processor(
+            text=formatted_text,
+            images=padded,
             return_tensors="pt",
             padding=True,
-            return_dict=True,
         )
-
-        print(f"[med_gemma] apply_chat_template keys: {list(model_inputs.keys())}")
-        print(f"[med_gemma] input_ids shape: {model_inputs['input_ids'].shape}")
-        has_pv = "pixel_values" in model_inputs
-        print(f"[med_gemma] pixel_values in apply_chat_template output: {has_pv}")
-
-        image_inputs = self._processor.image_processor(
-            padded,
-            return_tensors="pt",
-        )
-        print(f"[med_gemma] image_processor pixel_values shape: {image_inputs['pixel_values'].shape}")
-
-        model_inputs["pixel_values"] = image_inputs["pixel_values"]
-        if "pixel_attention_mask" in image_inputs:
-            model_inputs["pixel_attention_mask"] = image_inputs["pixel_attention_mask"]
-
-        model_inputs.pop("token_type_ids", None)
+        _dbg(f"processor keys: {list(model_inputs.keys())}")
 
         model_inputs = model_inputs.to(self._model.device)
         for key in ("pixel_values", "pixel_attention_mask"):
@@ -166,12 +164,15 @@ class MedGemmaBackend(VLMBackend):
         img_tok_id = getattr(self._model.config, 'image_token_index',
                      getattr(self._model.config, 'image_token_id', None))
         n_img = (model_inputs["input_ids"] == img_tok_id).sum().item()
-        print(f"[med_gemma] image_token_id={img_tok_id}, count in input_ids={n_img}")
+        _dbg(f"image_token_id={img_tok_id}, count in input_ids={n_img}, "
+             f"input_ids shape={model_inputs['input_ids'].shape}")
+        _dbg(f"has token_type_ids: {'token_type_ids' in model_inputs}")
 
-        pv = model_inputs["pixel_values"]
-        print(f"[med_gemma] pixel_values: dtype={pv.dtype}, shape={pv.shape}, "
-              f"min={pv.min().item():.4f}, max={pv.max().item():.4f}, "
-              f"mean={pv.mean().item():.4f}, std={pv.std().item():.4f}")
+        if "pixel_values" in model_inputs:
+            pv = model_inputs["pixel_values"]
+            _dbg(f"pixel_values: dtype={pv.dtype}, shape={pv.shape}, "
+                 f"min={pv.min().item():.4f}, max={pv.max().item():.4f}, "
+                 f"mean={pv.mean().item():.4f}")
 
         proj = None
         for _name, _mod in self._model.named_modules():
@@ -179,11 +180,11 @@ class MedGemmaBackend(VLMBackend):
                 proj = _mod.mm_input_projection_weight
                 break
         if proj is not None:
-            print(f"[med_gemma] projector weight from '{_name}': dtype={proj.dtype}, shape={proj.shape}, "
-                  f"min={proj.min().item():.6f}, max={proj.max().item():.6f}, "
-                  f"mean={proj.mean().item():.6f}")
+            _dbg(f"projector weight from '{_name}': dtype={proj.dtype}, shape={proj.shape}, "
+                 f"min={proj.min().item():.6f}, max={proj.max().item():.6f}, "
+                 f"mean={proj.mean().item():.6f}")
         else:
-            print("[med_gemma] projector weight NOT FOUND")
+            _dbg("projector weight NOT FOUND")
 
         with torch.inference_mode():
             img_feat = self._model.get_image_features(
@@ -191,14 +192,19 @@ class MedGemmaBackend(VLMBackend):
             )
             if hasattr(img_feat, 'pooler_output'):
                 img_feat = img_feat.pooler_output
-            print(f"[med_gemma] image_features: dtype={img_feat.dtype}, shape={img_feat.shape}, "
-                  f"min={img_feat.min().item():.4f}, max={img_feat.max().item():.4f}, "
-                  f"mean={img_feat.mean().item():.4f}, has_nan={torch.isnan(img_feat).any().item()}")
+            _dbg(f"image_features: dtype={img_feat.dtype}, shape={img_feat.shape}, "
+                 f"min={img_feat.min().item():.4f}, max={img_feat.max().item():.4f}, "
+                 f"mean={img_feat.mean().item():.4f}, has_nan={torch.isnan(img_feat).any().item()}")
 
         input_embeds = self._model.get_input_embeddings()(model_inputs["input_ids"])
-        print(f"[med_gemma] input_embeds before masked_scatter: "
-              f"min={input_embeds.min().item():.4f}, max={input_embeds.max().item():.4f}, "
-              f"mean={input_embeds.mean().item():.4f}")
+        _dbg(f"input_embeds before masked_scatter: "
+             f"min={input_embeds.min().item():.4f}, max={input_embeds.max().item():.4f}, "
+             f"mean={input_embeds.mean().item():.4f}")
+
+        if "attention_mask" in model_inputs:
+            am = model_inputs["attention_mask"]
+            _dbg(f"attention_mask: dtype={am.dtype}, shape={am.shape}, "
+                 f"min={am.min().item()}, max={am.max().item()}, sum={am.sum().item()}")
 
         if seed is not None:
             set_seed(seed)
@@ -215,17 +221,42 @@ class MedGemmaBackend(VLMBackend):
         if repetition_penalty > 1.0:
             gen_kwargs["repetition_penalty"] = float(repetition_penalty)
 
+        # ── Diagnostic forward pass before generate ──
+        _dbg("Running diagnostic forward pass...")
+        with torch.inference_mode():
+            diag_out = self._model(
+                **model_inputs,
+                logits_to_keep=1,
+                return_dict=True,
+            )
+        diag_logits = diag_out.logits  # [1, 1, vocab_size]
+        diag_last = diag_logits[0, -1]
+        diag_argmax = diag_last.argmax().item()
+        top5_vals, top5_ids = diag_last.topk(5)
+        _dbg(f"diagnostic forward logits[-1]: argmax={diag_argmax}, "
+             f"top5_ids={top5_ids.tolist()}, top5_vals={top5_vals.tolist():.4f}")
+        del diag_out, diag_logits
+
         with torch.inference_mode():
             output_ids = self._model.generate(**model_inputs, **gen_kwargs)
 
-        print(f"[med_gemma] output_ids shape: {output_ids.shape}")
+        _dbg(f"output_ids shape: {output_ids.shape}")
         input_len = model_inputs["input_ids"].shape[1]
         new_tokens = output_ids[:, input_len:]
-        print(f"[med_gemma] new_tokens ids: {new_tokens.tolist()}")
+        _dbg(f"new_tokens ids ({new_tokens.shape[1]} tokens): {new_tokens.tolist()}")
+
+        all_zero = (new_tokens == 0).all().item()
+        if all_zero:
+            _dbg("ALL NEW TOKENS ARE 0 — retrying with attention_mask=None")
+            gen_inputs = {k: v for k, v in model_inputs.items() if k != "attention_mask"}
+            with torch.inference_mode():
+                output_ids = self._model.generate(**gen_inputs, **gen_kwargs)
+            new_tokens = output_ids[:, input_len:]
+            _dbg(f"retry new_tokens ids: {new_tokens.tolist()}")
 
         decoded = self._processor.batch_decode(
             new_tokens, skip_special_tokens=True
         )[0]
-        print(f"[med_gemma] decoded: |{decoded}|")
+        _dbg(f"decoded: |{decoded}|")
 
         return decoded.strip()
