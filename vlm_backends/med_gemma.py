@@ -109,6 +109,7 @@ class MedGemmaBackend(VLMBackend):
             images=images,
             return_tensors="pt",
             padding=True,
+            add_special_tokens=False,
         )
         print(f"[med_gemma] inputs keys: {list(inputs.keys())}")
         print(f"[med_gemma] input_ids shape: {inputs['input_ids'].shape}")
@@ -129,11 +130,14 @@ class MedGemmaBackend(VLMBackend):
         if seed is not None:
             set_seed(seed)
 
+        self._processor.tokenizer.pad_token_id = 0
+
         do_sample = temperature > 0.0
         gen_kwargs = {
             "do_sample": do_sample,
             "max_new_tokens": int(max_new_tokens),
             "use_cache": True,
+            "pad_token_id": 0,
         }
         if do_sample:
             gen_kwargs["temperature"] = float(temperature)
