@@ -533,26 +533,34 @@ def save_results(results: list[dict], output_path: Path, output_s3_prefix: str) 
         print(f"  Uploaded: {url}")
 
 
+SOURCES_ALL = ["top_k", "oracle_tumor", "oracle_non_tumor", "hard_negative", "random", "diverse"]
+MODES_ALL = ["single", "separate", "context"]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="VLM inference pipeline")
     parser.add_argument("--registry_csv", default=REGISTRY_CSV_DEFAULT)
     parser.add_argument("--dataset", default="c16", choices=["c16", "c17", "c16_c17"])
     parser.add_argument("--model", default="med_gemma")
-    parser.add_argument("--mode", default="context", choices=["single", "separate", "context"])
-    parser.add_argument("--source", default="top_k")
+    parser.add_argument("--mode", default="all",
+                        help="single / separate / context / all (default: all)")
+    parser.add_argument("--source", default="all",
+                        help="source type or 'all' (default: all)")
     parser.add_argument("--n_patches", type=int, default=3)
     parser.add_argument("--max_slides", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
     parser.add_argument("--max_new_tokens", type=int, default=128)
-    parser.add_argument("--load_4bit", action="store_true")
+    parser.add_argument("--no_4bit", action="store_true",
+                        help="Disable 4-bit quantization (default: 4-bit enabled)")
     parser.add_argument("--cache_dir", default="/tmp/vlm_patch_cache")
     parser.add_argument("--output", default="")
     parser.add_argument("--output_s3", default="mil/vlm_results")
     parser.add_argument("--only_metrics", default="",
                         help="Load existing JSONL and recompute metrics")
     args = parser.parse_args()
+    load_4bit = not args.no_4bit
 
     if args.dataset == "c16":
         datasets = C16_DATASETS
@@ -560,6 +568,9 @@ def main() -> int:
         datasets = C17_DATASETS
     else:
         datasets = C16_DATASETS + C17_DATASETS
+
+    sources = SOURCES_ALL if args.source == "all" else [args.source]
+    modes = MODES_ALL if args.mode == "all" else [args.mode]
 
     if args.only_metrics:
         print(f"[pipeline] Loading existing results from {args.only_metrics}")
@@ -589,11 +600,16 @@ def main() -> int:
     if backend_cls_name is None:
         print(f"[pipeline] Unknown model: {args.model}")
         return 1
-    backend = getattr(mod, backend_cls_name)()
+    BackendClass = getattr(mod, backend_cls_name)
 
-    print(f"[pipeline] Loading model: {backend.model_id()}")
+    print(f"[pipeline] Model: {BackendClass.model_id()}")
+    print(f"[pipeline] Run config: dataset={args.dataset} sources={sources} modes={modes} "
+          f"temp={args.temperature} 4bit={load_4bit}")
+
+    backend = BackendClass()
+    print(f"[pipeline] Loading model...")
     try:
-        backend.load(load_4bit=args.load_4bit)
+        backend.load(load_4bit=load_4bit)
     except Exception as exc:
         print(f"[pipeline] ERROR loading model: {exc}")
         traceback.print_exc()
@@ -601,37 +617,55 @@ def main() -> int:
 
     backend_config = backend.config_snapshot()
     git_commit = _git_commit()
+    all_results = []
 
-    patch_sets = build_patch_sets(
-        registry, source=args.source,
-        n_patches=args.n_patches,
-    )
-    print(f"[pipeline] Built {len(patch_sets)} patch sets for source={args.source}")
+    for src in sources:
+        print(f"\n{'='*60}")
+        print(f"SOURCE: {src}")
+        print(f"{'='*60}")
 
-    results = run_inference(
-        backend=backend,
-        patch_sets=patch_sets,
-        mode=args.mode,
-        cache_dir=cache_dir,
-        seed=args.seed,
-        temperature=args.temperature,
-        repetition_penalty=args.repetition_penalty,
-        max_new_tokens=args.max_new_tokens,
-        backend_config=backend_config,
-        git_commit=git_commit,
-    )
+        patch_sets = build_patch_sets(
+            registry, source=src, n_patches=args.n_patches,
+        )
+        print(f"  Patch sets built: {len(patch_sets)}")
 
-    metrics = compute_metrics(results)
-    print_metrics(metrics)
+        for mode in modes:
+            print(f"\n  --- Mode: {mode} ---")
+            label = f"{src}/{mode}"
+
+            results = run_inference(
+                backend=backend,
+                patch_sets=patch_sets,
+                mode=mode,
+                cache_dir=cache_dir,
+                seed=args.seed,
+                temperature=args.temperature,
+                repetition_penalty=args.repetition_penalty,
+                max_new_tokens=args.max_new_tokens,
+                backend_config=backend_config,
+                git_commit=git_commit,
+            )
+
+            metrics = compute_metrics(results)
+            print(f"  Metrics for {label}:")
+            print_metrics(metrics)
+
+            for r in results:
+                r["run_label"] = label
+                all_results.append(r)
+
+    if not all_results:
+        print("[pipeline] No results produced.")
+        return 0
 
     if args.output:
         output_path = Path(args.output)
     else:
-        output_path = Path(tempfile.gettempdir()) / f"vlm_{args.dataset}_{args.model}_{args.mode}_{args.source}"
+        output_path = Path(tempfile.gettempdir()) / f"vlm_{args.dataset}_{args.model}"
 
-    save_results(results, output_path, args.output_s3)
+    save_results(all_results, output_path, args.output_s3)
 
-    print(f"[pipeline] Done. {len(results)} results at {output_path}")
+    print(f"\n[pipefine] Done. {len(all_results)} total results at {output_path}")
     return 0
 
 
