@@ -207,7 +207,7 @@ def load_registry(
         df = df[df["selection_source"].isin(sources)]
         print(f"  After source filter {sources}: {len(df)}")
 
-    slides = sorted(df["slide_id"].unique())
+    slides = sorted(df["slide_id"].dropna().unique())
     if max_slides > 0:
         keep = set(slides[:max_slides])
         df = df[df["slide_id"].isin(keep)]
