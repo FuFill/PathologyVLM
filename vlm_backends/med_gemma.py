@@ -81,6 +81,12 @@ class MedGemmaBackend(VLMBackend):
         self._revision = revision
         self._quantization = "4bit-nf4-double" if load_4bit else "none"
 
+        proc_id = self._processor.image_token_id
+        model_id = self._model.config.image_token_id
+        if proc_id != model_id:
+            print(f"[med_gemma] Aligning image_token_id: processor={proc_id} model={model_id} -> {proc_id}")
+            self._model.config.image_token_id = proc_id
+
     def config_snapshot(self) -> dict:
         return {
             "model_id": self.model_id(),
@@ -122,10 +128,16 @@ class MedGemmaBackend(VLMBackend):
             return_dict=True,
         )
 
+        print(f"[med_gemma] apply_chat_template keys: {list(model_inputs.keys())}")
+        print(f"[med_gemma] input_ids shape: {model_inputs['input_ids'].shape}")
+        has_pv = "pixel_values" in model_inputs
+        print(f"[med_gemma] pixel_values in apply_chat_template output: {has_pv}")
+
         image_inputs = self._processor.image_processor(
             padded,
             return_tensors="pt",
         )
+        print(f"[med_gemma] image_processor pixel_values shape: {image_inputs['pixel_values'].shape}")
 
         model_inputs["pixel_values"] = image_inputs["pixel_values"]
         if "pixel_attention_mask" in image_inputs:
@@ -137,6 +149,11 @@ class MedGemmaBackend(VLMBackend):
         for key in ("pixel_values", "pixel_attention_mask"):
             if key in model_inputs:
                 model_inputs[key] = model_inputs[key].to(dtype=torch.float16)
+
+        img_tok_id = self._model.config.image_token_id
+        n_img = (model_inputs["input_ids"] == img_tok_id).sum().item()
+        print(f"[med_gemma] image_token_id={img_tok_id}, count in input_ids={n_img}")
+        print(f"[med_gemma] pixel_values final: {model_inputs['pixel_values'].dtype}, {model_inputs['pixel_values'].shape}")
 
         if seed is not None:
             set_seed(seed)
@@ -156,10 +173,14 @@ class MedGemmaBackend(VLMBackend):
         with torch.inference_mode():
             output_ids = self._model.generate(**model_inputs, **gen_kwargs)
 
+        print(f"[med_gemma] output_ids shape: {output_ids.shape}")
         input_len = model_inputs["input_ids"].shape[1]
         new_tokens = output_ids[:, input_len:]
+        print(f"[med_gemma] new_tokens ids: {new_tokens.tolist()}")
+
         decoded = self._processor.batch_decode(
             new_tokens, skip_special_tokens=True
         )[0]
+        print(f"[med_gemma] decoded: |{decoded}|")
 
         return decoded.strip()
