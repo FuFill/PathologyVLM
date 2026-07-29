@@ -557,7 +557,7 @@ def main() -> int:
     parser.add_argument("--n_patches", type=int, default=3)
     parser.add_argument("--max_slides", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
     parser.add_argument("--max_new_tokens", type=int, default=128)
     parser.add_argument("--4bit", action="store_true", dest="four_bit",
