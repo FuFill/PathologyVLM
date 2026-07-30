@@ -285,6 +285,7 @@ def run_inference(
         slide_id = patches[0].get("slide_id", "unknown")
         source = patches[0].get("selection_source", "unknown")
         group = f"{slide_id}/{source}"
+        task_id = str(patches[0].get("task_id", patches[0].get("model_hash", ""))) if patches else ""
 
         set_id = _patch_set_uid(patches)
 
@@ -379,23 +380,27 @@ def run_inference(
                 print(f"    RAW[{ri}]: {trunc}")
         print(f"  [{idx}/{total}] {group}/{mode} → {ans_str} ({elapsed:.0f}s)")
 
+        n_shown = 1 if mode == "single" else len(pil_images)
+
         record = {
             "patch_set_uid": set_id,
             "slide_id": slide_id,
             "patient_id": str(patches[0].get("patient_id", "")),
             "dataset": str(patches[0].get("dataset", "")),
+            "task_id": task_id,
             "selection_source": source,
-            "group_label": f"{slide_id}/{source}/{mode}",
+            "group_label": f"{slide_id}/{source}/{mode}/{task_id}",
             "model_name": backend_config["model_id"],
             "model_revision": backend_config["revision"],
             "quantization": backend_config["quantization"],
+            "model_config": backend_config,
             "mode": mode,
             "temperature": temperature,
             "repetition_penalty": repetition_penalty,
             "max_new_tokens": max_new_tokens,
             "seed": seed,
             "git_commit": git_commit,
-            "n_patches_shown": len(pil_images),
+            "n_patches_shown": n_shown,
             "patches": patch_metas,
             "prompt": prompt,
             "raw_responses": raw_responses,
@@ -545,7 +550,11 @@ def print_metrics(metrics: dict) -> None:
 def save_results(results: list[dict], output_path: Path, output_s3_prefix: str) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    jsonl_path = output_path.with_suffix(".jsonl")
+    task_ids = sorted(set(r.get("task_id", "") for r in results if r.get("task_id")))
+    tid_slug = f"_{task_ids[0]}" if len(task_ids) == 1 else ""
+    stem = output_path.stem
+
+    jsonl_path = output_path.with_name(f"{stem}{tid_slug}.jsonl")
     with jsonl_path.open("w", encoding="utf-8") as f:
         for r in results:
             f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
@@ -565,13 +574,23 @@ def save_results(results: list[dict], output_path: Path, output_s3_prefix: str) 
             "error": r["error"],
         })
     summary_df = pd.DataFrame(summary)
-    csv_path = output_path.with_suffix(".csv")
+    csv_path = output_path.with_name(f"{stem}{tid_slug}.csv")
     summary_df.to_csv(csv_path, index=False)
 
     for f in [jsonl_path, csv_path]:
         s3_key = f"{output_s3_prefix}/{f.name}"
         url = upload_to_s3(str(f), s3_key)
         print(f"  Uploaded: {url}")
+
+    try:
+        from clearml import Task
+        clearml_task = Task.current_task()
+        if clearml_task:
+            clearml_task.upload_artifact(name="vlm_outputs_jsonl", artifact_object=str(jsonl_path))
+            clearml_task.upload_artifact(name="vlm_outputs_csv", artifact_object=str(csv_path))
+            print(f"  Uploaded to ClearML artifacts")
+    except Exception as exc:
+        print(f"  ClearML artifact upload skipped: {exc}")
 
 
 SOURCES_ALL = ["top_k", "oracle_tumor", "oracle_non_tumor", "hard_negative", "random", "diverse"]

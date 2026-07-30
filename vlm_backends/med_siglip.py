@@ -16,6 +16,7 @@ class MedSigLIPBackend(VLMBackend):
     def __init__(self) -> None:
         self._model = None
         self._processor = None
+        self._revision = None
 
     @staticmethod
     def model_id() -> str:
@@ -37,6 +38,8 @@ class MedSigLIPBackend(VLMBackend):
             token=True,
         )
         self._model.eval()
+        self._device = next(self._model.parameters()).device
+        self._revision = revision or getattr(self._model.config, '_commit_hash', None)
 
     def get_image_embedding(self, image: Image.Image) -> torch.Tensor:
         if self._model is None or self._processor is None:
@@ -98,3 +101,15 @@ class MedSigLIPBackend(VLMBackend):
             return "FINAL ANSWER: B"
         else:
             return "FINAL ANSWER: C"
+
+    def config_snapshot(self) -> dict:
+        import transformers
+        return {
+            "model_id": self.model_id(),
+            "revision": self._revision if hasattr(self, '_revision') else None,
+            "quantization": "none",
+            "torch_version": torch.__version__,
+            "transformers_version": transformers.__version__,
+            "device": str(self._device) if hasattr(self, '_device') else "unknown",
+            "dtype": str(next(self._model.parameters()).dtype) if self._model is not None else "unknown",
+        }

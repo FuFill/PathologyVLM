@@ -440,6 +440,45 @@ def main() -> int:
         print(f"      specificity: {spec_total:.4f}")
         print(f"      balanced_accuracy: {bacc_total:.4f}")
 
+        # --- Model selection decision ---
+        print(f"\n    === MODEL SELECTION: {model_key} ===")
+        oracle_tumor_recs = [r for r in records if r.get("group") == "oracle_tumor"]
+        oracle_non_tumor_recs = [r for r in records if r.get("group") == "oracle_non_tumor"]
+
+        if oracle_tumor_recs:
+            ot_m = _per_group_metrics(oracle_tumor_recs)
+            print(f"      oracle_tumor: sens={ot_m['sensitivity']:.4f}  "
+                  f"parsable={ot_m['n_parsable']}/{ot_m['n']}  "
+                  f"unique_raw={ot_m['unique_raw']}")
+        if oracle_non_tumor_recs:
+            ont_m = _per_group_metrics(oracle_non_tumor_recs)
+            print(f"      oracle_non_tumor: spec={ont_m['specificity']:.4f}  "
+                  f"parsable={ont_m['n_parsable']}/{ont_m['n']}  "
+                  f"unique_raw={ont_m['unique_raw']}")
+
+        if oracle_tumor_recs and oracle_non_tumor_recs:
+            ot_sens = ot_m.get("sensitivity", 0)
+            ont_spec = ont_m.get("specificity", 0)
+            ot_ba = ot_m.get("balanced_accuracy", 0)
+            ont_ba = ont_m.get("balanced_accuracy", 0)
+            mean_ba = (ot_ba + ont_ba) / 2
+            parse_rate = (ot_m.get("n_parsable", 0) + ont_m.get("n_parsable", 0)) / max(ot_m.get("n", 1) + ont_m.get("n", 1), 1)
+            mode_collapse_ot = ot_m.get("mode_collapse", 1) > 0.8
+            mode_collapse_ont = ont_m.get("mode_collapse", 1) > 0.8
+
+            print(f"      Combined: mean_balanced_acc={mean_ba:.4f}  parse_rate={parse_rate:.4f}")
+            discriminates = ot_sens > 0.4 and ont_spec > 0.4 and mean_ba > 0.45
+            if mode_collapse_ot or mode_collapse_ont:
+                print(f"      WARNING: mode collapse detected (unique_raw close to 1)")
+            if parse_rate < 0.8:
+                print(f"      WARNING: low parse rate ({parse_rate:.4f})")
+
+            if discriminates:
+                print(f"      >>> PASS: model distinguishes mask-positive from mask-negative")
+            else:
+                print(f"      >>> FAIL: model does NOT reliably distinguish groups")
+                print(f"      >>> C17 full run will NOT be meaningful for {model_key}")
+
     summary_df = pd.DataFrame(rows)
     if args.output:
         output_path = Path(args.output)
@@ -466,6 +505,16 @@ def main() -> int:
         s3_key = f"{args.output_s3}/{f.name}"
         url = upload_to_s3(str(f), s3_key)
         print(f"  Uploaded: {url}")
+
+    try:
+        from clearml import Task
+        clearml_task = Task.current_task()
+        if clearml_task:
+            clearml_task.upload_artifact(name="benchmark_json", artifact_object=str(output_path))
+            clearml_task.upload_artifact(name="benchmark_csv", artifact_object=str(csv_path))
+            print(f"  Uploaded to ClearML artifacts")
+    except Exception as exc:
+        print(f"  ClearML artifact upload skipped: {exc}")
 
     print(f"\n[benchmark] Done. Results at {output_path}")
     return 0

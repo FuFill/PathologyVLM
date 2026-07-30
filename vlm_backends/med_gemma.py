@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from typing import Optional
 
 import torch
@@ -78,7 +79,7 @@ class MedGemmaBackend(VLMBackend):
         )
         self._model.eval()
         self._device = next(self._model.parameters()).device
-        self._revision = revision
+        self._revision = revision or getattr(self._model.config, '_commit_hash', None)
         self._quantization = "4bit-nf4-double" if load_4bit else "none"
 
         proc_id = self._processor.image_token_id
@@ -88,10 +89,15 @@ class MedGemmaBackend(VLMBackend):
             self._model.config.image_token_index = proc_id
 
     def config_snapshot(self) -> dict:
+        import transformers
         return {
             "model_id": self.model_id(),
             "revision": self._revision,
             "quantization": self._quantization,
+            "torch_version": torch.__version__,
+            "transformers_version": transformers.__version__,
+            "device": str(self._device),
+            "dtype": str(next(self._model.parameters()).dtype) if self._model is not None else "unknown",
         }
 
     def generate(

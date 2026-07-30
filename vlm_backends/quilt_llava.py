@@ -119,6 +119,7 @@ class QuiltLLaVABackend(VLMBackend):
         self._model = None
         self._image_processor = None
         self._device = None
+        self._revision = None
 
     @staticmethod
     def model_id() -> str:
@@ -144,6 +145,7 @@ class QuiltLLaVABackend(VLMBackend):
         )
         self._model.eval()
         self._device = next(self._model.parameters()).device
+        self._revision = revision or getattr(self._model.config, '_commit_hash', None)
 
     def generate(
         self,
@@ -247,3 +249,15 @@ class QuiltLLaVABackend(VLMBackend):
             decoded = decoded[: -len(stop_str)]
 
         return decoded.strip()
+
+    def config_snapshot(self) -> dict:
+        import transformers
+        return {
+            "model_id": self.model_id(),
+            "revision": self._revision,
+            "quantization": "4bit" if getattr(self, '_load_4bit', False) else "none",
+            "torch_version": torch.__version__,
+            "transformers_version": transformers.__version__,
+            "device": str(self._device) if self._device else "unknown",
+            "dtype": str(next(self._model.parameters()).dtype) if self._model is not None else "unknown",
+        }

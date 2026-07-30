@@ -221,7 +221,10 @@ def main() -> int:
     if args.output:
         output_path = Path(args.output)
     else:
-        output_path = Path(tempfile.gettempdir()) / "pipeline_evaluation.json"
+        top3_rows = _load_jsonl(args.top3_jsonl)
+        task_ids = sorted(set(r.get("task_id", "") for r in top3_rows if r.get("task_id")))
+        tid_slug = f"_{task_ids[0]}" if len(task_ids) == 1 else ""
+        output_path = Path(tempfile.gettempdir()) / f"pipeline_evaluation{tid_slug}.json"
 
     all_results = {
         "ground_truth": {
@@ -246,6 +249,15 @@ def main() -> int:
     s3_key = f"{args.output_s3}/{output_path.name}"
     upload_to_s3(str(output_path), s3_key)
     print(f"\n[evaluate] Results uploaded: s3://pershin-medailab/{s3_key}")
+
+    try:
+        from clearml import Task
+        clearml_task = Task.current_task()
+        if clearml_task:
+            clearml_task.upload_artifact(name="pipeline_evaluation", artifact_object=str(output_path))
+            print(f"  Uploaded to ClearML artifacts")
+    except Exception:
+        pass
 
     return 0
 

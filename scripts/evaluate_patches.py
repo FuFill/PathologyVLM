@@ -102,6 +102,19 @@ def _compute_patch_metrics(results_path: str, registry_csv: str) -> dict:
 
     answer_dist = Counter(r["answer"] for r in per_patch_results if r["parse_valid"])
 
+    pos_sets = [r for r in per_patch_results if r["any_mask_positive"] and r["parse_valid"]]
+    neg_sets = [r for r in per_patch_results if r["all_mask_negative"] and r["parse_valid"]]
+    mixed_sets = [r for r in per_patch_results if not r["all_mask_negative"] and r["any_mask_positive"] and r["parse_valid"]]
+
+    def call_rate(sets: list[dict], answer: str) -> float:
+        return sum(1 for r in sets if r["answer"] == answer) / len(sets) if sets else 0.0
+
+    tumor_call_rate_pos = call_rate(pos_sets, "A")
+    tumor_call_rate_neg = call_rate(neg_sets, "A")
+    abstain_on_negative = call_rate(neg_sets, "C")
+    mixed_call_rate = call_rate(mixed_sets, "A")
+    call_rate_gap = tumor_call_rate_pos - tumor_call_rate_neg
+
     return {
         "n_total_sets": n,
         "n_parsable": n_parsable,
@@ -115,6 +128,11 @@ def _compute_patch_metrics(results_path: str, registry_csv: str) -> dict:
         "false_negative_rate": fn_rate,
         "abstain_rate": abstain_rate,
         "answer_distribution": dict(answer_dist),
+        "tumor_call_rate_pos": tumor_call_rate_pos,
+        "tumor_call_rate_neg": tumor_call_rate_neg,
+        "abstain_on_negative": abstain_on_negative,
+        "mixed_call_rate": mixed_call_rate,
+        "call_rate_gap": call_rate_gap,
         "error_slides_fp": list(set(r["slide_id"] for r in false_positive)),
         "error_slides_fn": list(set(r["slide_id"] for r in false_negative)),
     }
@@ -147,7 +165,10 @@ def main() -> int:
     if args.output:
         output_path = Path(args.output)
     else:
-        output_path = Path(tempfile.gettempdir()) / "patch_evaluation.json"
+        rows = _load_jsonl(args.jsonl)
+        task_ids = sorted(set(r.get("task_id", "") for r in rows if r.get("task_id")))
+        tid_slug = f"_{task_ids[0]}" if len(task_ids) == 1 else ""
+        output_path = Path(tempfile.gettempdir()) / f"patch_evaluation{tid_slug}.json"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False))
@@ -155,6 +176,15 @@ def main() -> int:
     s3_key = f"{args.output_s3}/{output_path.name}"
     upload_to_s3(str(output_path), s3_key)
     print(f"\n[evaluate_patches] Results uploaded: s3://pershin-medailab/{s3_key}")
+
+    try:
+        from clearml import Task
+        clearml_task = Task.current_task()
+        if clearml_task:
+            clearml_task.upload_artifact(name="patch_evaluation", artifact_object=str(output_path))
+            print(f"  Uploaded to ClearML artifacts")
+    except Exception:
+        pass
 
     return 0
 
