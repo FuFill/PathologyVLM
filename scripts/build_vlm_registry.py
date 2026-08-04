@@ -1,8 +1,11 @@
 """Build new VLM patch registry with tissue fraction and required fields.
 
-Reads original MIL metadata CSVs, computes tissue_fraction from PNGs,
-deduplicates coordinates, generates 3 random seed selections, and saves
-registry CSV + Parquet to S3.
+Reads original MIL metadata CSVs, deduplicates coordinates, generates 3
+random seed selections, and saves registry CSV + Parquet to S3.
+
+tissue_fraction is computed from patch PNGs only when --local_archive_dir
+or --use_s3_images is given; otherwise the values are merged from the
+previous registry CSV.
 
 For each physical patch saves:
   - dataset, patient_id, slide_id
@@ -459,18 +462,15 @@ def main() -> int:
                         help="Local path to extracted archive (e.g. c16_abmil_vlm_patches_*/vlm_patches)")
     parser.add_argument("--use_s3_images", action="store_true",
                         help="Download images from S3 for tissue_fraction (slow)")
+    parser.add_argument("--previous_registry_csv", default="",
+                        help="Previous registry CSV (s3:// or local) to merge tissue_fraction "
+                             "from when tissue_fraction is not computed. "
+                             "Default: the current registry at --output_s3_prefix/patch_registry.csv")
     parser.add_argument("--output_s3_prefix", default="mil/vlm_patches_registry",
                         help="S3 prefix for output")
-    parser.add_argument("--skip_tissue_fraction", action="store_true",
-                        help="Skip tissue_fraction image computation; values are merged "
-                             "from the previous registry CSV instead")
     parser.add_argument("--skip_tumor_gt_recompute", action="store_true",
                         help="Keep inherited tile_in_mask as tumor_mask_overlap instead of "
                              "recomputing from annotation XMLs with the 20% area rule")
-    parser.add_argument("--previous_registry_csv", default="",
-                        help="Previous registry CSV (s3:// or local) to merge tissue_fraction "
-                             "from when --skip_tissue_fraction is used. "
-                             "Default: the current registry at --output_s3_prefix/patch_registry.csv")
     args = parser.parse_args()
 
     local_dir = Path(args.local_archive_dir) if args.local_archive_dir else None
@@ -494,12 +494,12 @@ def main() -> int:
     combined["region_uid"] = combined.apply(_region_uid, axis=1)
     combined["is_diverse"] = combined["is_diverse"].fillna(0).astype(int)
 
-    if args.skip_tissue_fraction:
+    if args.local_archive_dir or args.use_s3_images:
+        combined = _compute_tissue_fractions(combined, local_dir, args.use_s3_images)
+    else:
         prev_csv = args.previous_registry_csv or f"{args.output_s3_prefix}/patch_registry.csv"
         combined = _merge_previous_tissue_fraction(combined, prev_csv)
-        print(f"[registry] Skipping tissue_fraction computation, merged from {prev_csv}")
-    else:
-        combined = _compute_tissue_fractions(combined, local_dir, args.use_s3_images)
+        print(f"[registry] tissue_fraction merged from previous registry: {prev_csv}")
 
     combined = _deduplicate_coordinates(combined)
 
