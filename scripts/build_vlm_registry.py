@@ -358,6 +358,26 @@ def _compute_tumor_gt(df: pd.DataFrame, client) -> pd.DataFrame:
     return df
 
 
+def _merge_previous_tissue_fraction(df: pd.DataFrame, previous_csv: str) -> pd.DataFrame:
+    if previous_csv.startswith("s3://"):
+        prev = read_csv_from_s3(previous_csv.split("/", 3)[3])
+    elif os.path.exists(previous_csv):
+        prev = pd.read_csv(previous_csv)
+    else:
+        prev = read_csv_from_s3(previous_csv)
+    uid_to_tf = {}
+    for _, row in prev.iterrows():
+        uid = str(row.get("region_uid", ""))
+        tf = row.get("tissue_fraction", np.nan)
+        if uid and pd.notna(tf):
+            uid_to_tf[uid] = float(tf)
+    vals = [uid_to_tf.get(str(uid), np.nan) for uid in df["region_uid"]]
+    df["tissue_fraction"] = vals
+    n_found = int(sum(1 for v in vals if pd.notna(v)))
+    print(f"  Merged tissue_fraction from previous registry: {n_found}/{len(df)} rows")
+    return df
+
+
 def _build_output_registry(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame()
     out["dataset"] = df["dataset"]
@@ -442,10 +462,15 @@ def main() -> int:
     parser.add_argument("--output_s3_prefix", default="mil/vlm_patches_registry",
                         help="S3 prefix for output")
     parser.add_argument("--skip_tissue_fraction", action="store_true",
-                        help="Skip tissue_fraction computation, set to 1.0")
+                        help="Skip tissue_fraction image computation; values are merged "
+                             "from the previous registry CSV instead")
     parser.add_argument("--skip_tumor_gt_recompute", action="store_true",
                         help="Keep inherited tile_in_mask as tumor_mask_overlap instead of "
                              "recomputing from annotation XMLs with the 20% area rule")
+    parser.add_argument("--previous_registry_csv", default="",
+                        help="Previous registry CSV (s3:// or local) to merge tissue_fraction "
+                             "from when --skip_tissue_fraction is used. "
+                             "Default: the current registry at --output_s3_prefix/patch_registry.csv")
     args = parser.parse_args()
 
     local_dir = Path(args.local_archive_dir) if args.local_archive_dir else None
@@ -470,8 +495,9 @@ def main() -> int:
     combined["is_diverse"] = combined["is_diverse"].fillna(0).astype(int)
 
     if args.skip_tissue_fraction:
-        combined["tissue_fraction"] = 1.0
-        print("[registry] Skipping tissue_fraction, set to 1.0")
+        prev_csv = args.previous_registry_csv or f"{args.output_s3_prefix}/patch_registry.csv"
+        combined = _merge_previous_tissue_fraction(combined, prev_csv)
+        print(f"[registry] Skipping tissue_fraction computation, merged from {prev_csv}")
     else:
         combined = _compute_tissue_fractions(combined, local_dir, args.use_s3_images)
 
