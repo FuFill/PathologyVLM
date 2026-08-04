@@ -57,6 +57,15 @@ def upload_to_s3(local_path: str, s3_path: str) -> str:
     return f"s3://{_BUCKET}/{key}"
 
 
+def presign_url(s3_path: str, expires: int = 604800) -> str:
+    """Generate a presigned GET URL for an s3://bucket/key path (ClearML artifacts)."""
+    bucket, key = s3_path.replace("s3://", "", 1).split("/", 1)
+    client = get_s3_client()
+    return client.generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires
+    )
+
+
 def download_tar_and_extract(
     tar_path: str,
     internal_path: str,

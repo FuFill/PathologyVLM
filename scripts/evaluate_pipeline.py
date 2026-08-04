@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.s3_utils import get_s3_client, upload_to_s3
+from src.s3_utils import get_s3_client, presign_url, upload_to_s3
 
 REGISTRY_CSV_DEFAULT = "s3://pershin-medailab/Pathomorphology/CAMELYON/mil/vlm_patches_registry/patch_registry.csv"
 
@@ -247,14 +247,15 @@ def main() -> int:
     output_path.write_text(json.dumps(all_results, indent=2, ensure_ascii=False))
 
     s3_key = f"{args.output_s3}/{output_path.name}"
-    upload_to_s3(str(output_path), s3_key)
-    print(f"\n[evaluate] Results uploaded: s3://pershin-medailab/{s3_key}")
+    s3_uri = upload_to_s3(str(output_path), s3_key)
+    print(f"\n[evaluate] Results uploaded: {s3_uri}")
 
     try:
         from clearml import Task
         clearml_task = Task.current_task()
         if clearml_task:
-            clearml_task.upload_artifact(name="pipeline_evaluation", artifact_object=str(output_path))
+            clearml_task.upload_artifact(name="pipeline_evaluation", artifact_object=presign_url(s3_uri))
+            clearml_task.set_parameter("outputs/pipeline_evaluation_uri", s3_uri)
             print(f"  Uploaded to ClearML artifacts")
     except Exception:
         pass

@@ -43,6 +43,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.s3_utils import (
     get_minio_path_components,
     get_s3_client,
+    presign_url,
     read_csv_from_s3,
     upload_to_s3,
 )
@@ -577,17 +578,21 @@ def save_results(results: list[dict], output_path: Path, output_s3_prefix: str) 
     csv_path = output_path.with_name(f"{stem}{tid_slug}.csv")
     summary_df.to_csv(csv_path, index=False)
 
+    urls = {}
     for f in [jsonl_path, csv_path]:
         s3_key = f"{output_s3_prefix}/{f.name}"
         url = upload_to_s3(str(f), s3_key)
+        urls[f.name] = (url, s3_key)
         print(f"  Uploaded: {url}")
 
     try:
         from clearml import Task
         clearml_task = Task.current_task()
         if clearml_task:
-            clearml_task.upload_artifact(name="vlm_outputs_jsonl", artifact_object=str(jsonl_path))
-            clearml_task.upload_artifact(name="vlm_outputs_csv", artifact_object=str(csv_path))
+            for name, local_path in (("vlm_outputs_jsonl", jsonl_path), ("vlm_outputs_csv", csv_path)):
+                s3_uri, _key = urls[local_path.name]
+                clearml_task.upload_artifact(name=name, artifact_object=presign_url(s3_uri))
+                clearml_task.set_parameter(f"outputs/{name}_uri", s3_uri)
             print(f"  Uploaded to ClearML artifacts")
     except Exception as exc:
         print(f"  ClearML artifact upload skipped: {exc}")

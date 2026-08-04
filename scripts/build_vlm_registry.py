@@ -9,12 +9,19 @@ For each physical patch saves:
   - region_uid (unique physical area hash)
   - x, y, tile_size, mag
   - tissue_fraction
-  - tumor_mask_overlap
+  - tumor_mask_overlap (area fraction >= 20% of patch inside annotation polygons)
+  - tumor_overlap_fraction (raw area fraction)
+  - tumor_mask_overlap_center (legacy: tile center inside polygons)
   - selection_source + rank
   - task_id + model_hash
   - relative_path inside archive
   - context_set (standard/diverse) for group labelling
   - random_seed (0 for non-random, seed value for random)
+
+Tumor GT is recomputed from the Camelyon annotation XMLs on S3
+(C16: 16/{training|testing}/annotations/{slide}.xml by split column,
+C17: 17/annotations/{slide_id}.xml). Use --skip_tumor_gt_recompute to
+keep the inherited tile_in_mask values instead.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ import os
 import sys
 import tarfile
 import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +45,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.s3_utils import get_s3_client, read_csv_from_s3, upload_to_s3
+
+MINIO_BUCKET = "pershin-medailab"
+MINIO_PREFIX = "Pathomorphology/CAMELYON"
+
+TUMOR_GT_GRID = 20
+TUMOR_GT_THRESHOLD = 0.2
 
 # --- Task ID mapping ---
 C16_TASK = "a50fbde29aa04e9d829a4580fd5c68b8"
@@ -115,6 +129,7 @@ def _load_metadata_csv(name: str, s3_path: str) -> pd.DataFrame:
             "dataset": name,
             "patient_id": _parse_patient(slide),
             "slide_id": slide,
+            "split": str(row.get("split", "")).strip().lower(),
             "x": pd.to_numeric(row.get("x", 0), errors="coerce"),
             "y": pd.to_numeric(row.get("y", 0), errors="coerce"),
             "tile_size": pd.to_numeric(row.get("tile_size", 256), errors="coerce"),
@@ -228,6 +243,121 @@ def _compute_tissue_fractions(
     return df
 
 
+def _parse_camelyon_xml(data: bytes) -> list:
+    root = ET.fromstring(data)
+    polygons = []
+    for annotation in root.findall(".//Annotation"):
+        coords = []
+        for coord in annotation.findall(".//Coordinate"):
+            coords.append([float(coord.get("X")), float(coord.get("Y"))])
+        if len(coords) >= 3:
+            polygons.append(np.array(coords, dtype=np.float32))
+    return polygons
+
+
+def _raycast_inside(px: np.ndarray, py: np.ndarray, poly: np.ndarray) -> np.ndarray:
+    n = len(poly)
+    inside = np.zeros(len(px), dtype=bool)
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        cond = (y1 > py) != (y2 > py)
+        if not cond.any():
+            continue
+        xc = (x2 - x1) * (py[cond] - y1) / (y2 - y1) + x1
+        inside[cond] ^= px[cond] < xc
+    return inside
+
+
+def _points_in_polygons(px: np.ndarray, py: np.ndarray, polygons: list) -> np.ndarray:
+    inside = np.zeros(len(px), dtype=bool)
+    for poly in polygons:
+        xmin, ymin = poly.min(axis=0)
+        xmax, ymax = poly.max(axis=0)
+        in_bb = (px >= xmin) & (px <= xmax) & (py >= ymin) & (py <= ymax)
+        if not in_bb.any():
+            continue
+        inside[in_bb] |= _raycast_inside(px[in_bb], py[in_bb], poly)
+    return inside
+
+
+def _patch_overlap_fraction(
+    x: float, y: float, tile_size: float, polygons: list, grid: int = TUMOR_GT_GRID
+) -> float:
+    offs = (np.arange(grid) + 0.5) * (tile_size / grid)
+    px, py = np.meshgrid(x + offs, y + offs)
+    px = px.ravel()
+    py = py.ravel()
+    inside = _points_in_polygons(px, py, polygons)
+    return float(inside.mean())
+
+
+def _load_slide_polygons(client, dataset: str, slide: str, split: str):
+    if dataset in ("c16_native", "c17_to_c16"):
+        if str(slide).startswith("normal_"):
+            return None
+        prefixes = ["16/testing/annotations", "16/training/annotations"]
+        if split == "train":
+            prefixes = ["16/training/annotations", "16/testing/annotations"]
+    else:
+        prefixes = ["17/annotations"]
+
+    for prefix in prefixes:
+        key = f"{MINIO_PREFIX}/{prefix}/{slide}.xml"
+        try:
+            obj = client.get_object(Bucket=MINIO_BUCKET, Key=key)
+            polygons = _parse_camelyon_xml(obj["Body"].read())
+            return polygons if polygons else None
+        except Exception:
+            continue
+    return None
+
+
+def _compute_tumor_gt(df: pd.DataFrame, client) -> pd.DataFrame:
+    print(f"  Recomputing tumor GT for {len(df)} patches from annotation XMLs...")
+    cache: dict = {}
+    fracs = []
+    mask20 = []
+    mask_center = []
+    n_missing = 0
+    total = len(df)
+    for idx, (_, row) in enumerate(df.iterrows()):
+        if idx % 1000 == 0:
+            print(f"    [{idx}/{total}]")
+        ds = str(row.get("dataset", ""))
+        slide = str(row.get("slide_id", ""))
+        key = (ds, slide)
+        if key not in cache:
+            cache[key] = _load_slide_polygons(client, ds, slide, str(row.get("split", "")))
+            if cache[key] is None:
+                n_missing += 1
+        polygons = cache[key]
+
+        x = float(row.get("x", 0))
+        y = float(row.get("y", 0))
+        ts = float(row.get("tile_size", 256))
+        if polygons:
+            frac = _patch_overlap_fraction(x, y, ts, polygons)
+            center_inside = _points_in_polygons(
+                np.array([x + ts / 2.0]), np.array([y + ts / 2.0]), polygons
+            )[0]
+        else:
+            frac = 0.0
+            center_inside = False
+
+        fracs.append(frac)
+        mask20.append(int(frac >= TUMOR_GT_THRESHOLD))
+        mask_center.append(int(center_inside))
+
+    df["tumor_overlap_fraction"] = fracs
+    df["tumor_mask_overlap"] = mask20
+    df["tumor_mask_overlap_center"] = mask_center
+    print(f"    Done. Slides without XML: {n_missing}/{df['slide_id'].nunique()}.")
+    print(f"    Mask-pos (>=20% area): {sum(mask20)} ({sum(mask20) / max(len(df), 1):.1%}), "
+          f"center-pos: {sum(mask_center)} ({sum(mask_center) / max(len(df), 1):.1%})")
+    return df
+
+
 def _build_output_registry(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame()
     out["dataset"] = df["dataset"]
@@ -240,6 +370,8 @@ def _build_output_registry(df: pd.DataFrame) -> pd.DataFrame:
     out["mag"] = df["mag"]
     out["tissue_fraction"] = df["tissue_fraction"]
     out["tumor_mask_overlap"] = df["tumor_mask_overlap"]
+    out["tumor_overlap_fraction"] = df.get("tumor_overlap_fraction", np.nan)
+    out["tumor_mask_overlap_center"] = df.get("tumor_mask_overlap_center", np.nan)
     out["selection_source"] = df["selection_source"]
     out["rank"] = df["rank"]
     out["task_id"] = df["task_id"]
@@ -311,6 +443,9 @@ def main() -> int:
                         help="S3 prefix for output")
     parser.add_argument("--skip_tissue_fraction", action="store_true",
                         help="Skip tissue_fraction computation, set to 1.0")
+    parser.add_argument("--skip_tumor_gt_recompute", action="store_true",
+                        help="Keep inherited tile_in_mask as tumor_mask_overlap instead of "
+                             "recomputing from annotation XMLs with the 20% area rule")
     args = parser.parse_args()
 
     local_dir = Path(args.local_archive_dir) if args.local_archive_dir else None
@@ -343,6 +478,11 @@ def main() -> int:
     combined = _deduplicate_coordinates(combined)
 
     combined = _generate_random_subsets(combined)
+
+    if args.skip_tumor_gt_recompute:
+        print("[registry] Skipping tumor GT recompute, keeping inherited tumor_mask_overlap")
+    else:
+        combined = _compute_tumor_gt(combined, get_s3_client())
 
     registry = _build_output_registry(combined)
 

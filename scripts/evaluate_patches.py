@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.s3_utils import get_s3_client, upload_to_s3
+from src.s3_utils import get_s3_client, presign_url, upload_to_s3
 
 REGISTRY_CSV_DEFAULT = "s3://pershin-medailab/Pathomorphology/CAMELYON/mil/vlm_patches_registry/patch_registry.csv"
 
@@ -58,11 +58,16 @@ def _compute_patch_metrics(results_path: str, registry_csv: str) -> dict:
             uid_to_mask[uid] = int(r.get("tumor_mask_overlap", 0))
 
     per_patch_results = []
+    n_patch_uids = 0
+    n_missing_uids = 0
     for r in rows:
         patches = r.get("patches", {})
         patch_tile_in_mask = []
         for pk, pv in patches.items():
             uid = pv.get("region_uid", "")
+            if uid not in uid_to_mask:
+                n_missing_uids += 1
+            n_patch_uids += 1
             mask_val = uid_to_mask.get(uid, 0)
             patch_tile_in_mask.append(mask_val)
 
@@ -135,7 +140,18 @@ def _compute_patch_metrics(results_path: str, registry_csv: str) -> dict:
         "call_rate_gap": call_rate_gap,
         "error_slides_fp": list(set(r["slide_id"] for r in false_positive)),
         "error_slides_fn": list(set(r["slide_id"] for r in false_negative)),
+        "n_patch_uids": n_patch_uids,
+        "n_missing_registry_uids": n_missing_uids,
     }
+
+    if n_patch_uids > 0 and n_missing_uids > 0:
+        miss_frac = n_missing_uids / n_patch_uids
+        print(f"\n[evaluate_patches] WARNING: {n_missing_uids}/{n_patch_uids} "
+              f"({miss_frac:.1%}) patch uids NOT found in registry — "
+              f"their GT defaults to 0, metrics may be biased.")
+        if miss_frac > 0.05:
+            print("[evaluate_patches] WARNING: >5% missing uids. Check that the JSONL "
+                  "and registry were built from the same registry version.")
 
 
 def main() -> int:
@@ -174,14 +190,15 @@ def main() -> int:
     output_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False))
 
     s3_key = f"{args.output_s3}/{output_path.name}"
-    upload_to_s3(str(output_path), s3_key)
-    print(f"\n[evaluate_patches] Results uploaded: s3://pershin-medailab/{s3_key}")
+    s3_uri = upload_to_s3(str(output_path), s3_key)
+    print(f"\n[evaluate_patches] Results uploaded: {s3_uri}")
 
     try:
         from clearml import Task
         clearml_task = Task.current_task()
         if clearml_task:
-            clearml_task.upload_artifact(name="patch_evaluation", artifact_object=str(output_path))
+            clearml_task.upload_artifact(name="patch_evaluation", artifact_object=presign_url(s3_uri))
+            clearml_task.set_parameter("outputs/patch_evaluation_uri", s3_uri)
             print(f"  Uploaded to ClearML artifacts")
     except Exception:
         pass

@@ -34,7 +34,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.s3_utils import get_minio_path_components, get_s3_client, upload_to_s3
+from src.s3_utils import get_minio_path_components, get_s3_client, presign_url, upload_to_s3
 
 PROMPT_TEMPLATE_SINGLE = """You are a pathology AI analyzing an H&E stained lymph node tissue patch.
 
@@ -501,17 +501,21 @@ def main() -> int:
     csv_path = output_path.with_suffix(".csv")
     summary_df.to_csv(csv_path, index=False)
 
+    urls = {}
     for f in [output_path, csv_path]:
         s3_key = f"{args.output_s3}/{f.name}"
         url = upload_to_s3(str(f), s3_key)
+        urls[f.name] = url
         print(f"  Uploaded: {url}")
 
     try:
         from clearml import Task
         clearml_task = Task.current_task()
         if clearml_task:
-            clearml_task.upload_artifact(name="benchmark_json", artifact_object=str(output_path))
-            clearml_task.upload_artifact(name="benchmark_csv", artifact_object=str(csv_path))
+            clearml_task.upload_artifact(name="benchmark_json", artifact_object=presign_url(urls[output_path.name]))
+            clearml_task.upload_artifact(name="benchmark_csv", artifact_object=presign_url(urls[csv_path.name]))
+            clearml_task.set_parameter("outputs/benchmark_json_uri", urls[output_path.name])
+            clearml_task.set_parameter("outputs/benchmark_csv_uri", urls[csv_path.name])
             print(f"  Uploaded to ClearML artifacts")
     except Exception as exc:
         print(f"  ClearML artifact upload skipped: {exc}")
