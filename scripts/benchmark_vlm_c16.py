@@ -289,6 +289,10 @@ def _run_model(
 
             ans, valid = _parse_answer(raw)
 
+            if pi < 3 or not valid:
+                trunc = raw[:300].replace("\n", "\\n")
+                print(f"    RAW[{pi+1}]: {trunc}")
+
             all_records.append({
                 "model": model_key,
                 "patch_uid": str(patch.get("patch_uid", "")),

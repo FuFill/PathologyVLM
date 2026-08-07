@@ -233,6 +233,14 @@ class QuiltLLaVABackend(VLMBackend):
         else:
             image_tensor = image_tensor.to(self._device, dtype=torch.float16)
 
+        input_ids = (
+            tokenizer_image_token(
+                full_prompt, self._tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
+            )
+            .unsqueeze(0)
+            .to(self._device)
+        )
+
         if not self._diagnostics_printed:
             self._diagnostics_printed = True
             try:
@@ -240,6 +248,30 @@ class QuiltLLaVABackend(VLMBackend):
                     diag_t = image_tensor[0]
                 else:
                     diag_t = image_tensor
+
+                print(f"[quilt_llava] full_prompt: {full_prompt!r}")
+                print(
+                    f"[quilt_llava] config: mm_use_im_start_end="
+                    f"{getattr(self._model.config, 'mm_use_im_start_end', None)} "
+                    f"image_aspect_ratio="
+                    f"{getattr(self._model.config, 'image_aspect_ratio', None)} "
+                    f"mm_vision_tower={getattr(self._model.config, 'mm_vision_tower', None)}"
+                )
+
+                n_img_tokens = int((input_ids == IMAGE_TOKEN_INDEX).sum().item())
+                print(
+                    f"[quilt_llava] input_ids: dtype={input_ids.dtype} "
+                    f"shape={tuple(input_ids.shape)} n_image_token_index={n_img_tokens} "
+                    f"min={int(input_ids.min().item())} max={int(input_ids.max().item())}"
+                )
+                if n_img_tokens == 0:
+                    print(
+                        "[quilt_llava] WARNING: input_ids has NO IMAGE_TOKEN_INDEX (-200). "
+                        "The image will be silently DROPPED by the fork's "
+                        "prepare_inputs_labels_for_multimodal hacky-fix branch -> "
+                        "model runs text-only -> constant answers!"
+                    )
+
                 print(
                     f"[quilt_llava] pixel_values: dtype={diag_t.dtype} "
                     f"shape={tuple(diag_t.shape)} min={diag_t.min().item():.4f} "
@@ -254,16 +286,44 @@ class QuiltLLaVABackend(VLMBackend):
                     f"max={image_features.max().item():.4f} mean={image_features.mean().item():.4f} "
                     f"has_nan={bool(torch.isnan(image_features).any().item())}"
                 )
+
+                def _top5(logits: torch.Tensor) -> str:
+                    vals, idx = logits.float().flatten().topk(5)
+                    return (
+                        f"argmax={int(idx[0].item())} "
+                        f"top5_ids={[int(i) for i in idx.tolist()]} "
+                        f"top5_vals={[f'{v:.4f}' for v in vals.tolist()]}"
+                    )
+
+                with torch.inference_mode():
+                    out_img = self._model(
+                        input_ids=input_ids,
+                        attention_mask=torch.ones_like(input_ids),
+                        images=image_tensor,
+                        use_cache=False,
+                    )
+                logits_img = out_img.logits[0, -1]
+                print(f"[quilt_llava] diagnostic forward WITH image logits[-1]: {_top5(logits_img)}")
+
+                ids_text = input_ids.clone()
+                ids_text[ids_text < 0] = 0  # -200 -> pad, so the text-only path is valid
+                with torch.inference_mode():
+                    out_text = self._model(
+                        input_ids=ids_text,
+                        attention_mask=torch.ones_like(ids_text),
+                        images=None,
+                        use_cache=False,
+                    )
+                logits_text = out_text.logits[0, -1]
+                print(f"[quilt_llava] diagnostic forward WITHOUT image logits[-1]: {_top5(logits_text)}")
+
+                diff = (logits_img - logits_text).abs().max().item()
+                print(
+                    f"[quilt_llava] max_logit_diff_image_vs_text={diff:.6f} "
+                    f"({'IMAGE IS USED' if diff > 0.01 else 'IMAGE IS IGNORED -> root cause'})"
+                )
             except Exception as exc:  # noqa: BLE001 — diagnostics must not break inference
                 print(f"[quilt_llava] WARNING: image diagnostics failed: {type(exc).__name__}: {exc}")
-
-        input_ids = (
-            tokenizer_image_token(
-                full_prompt, self._tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
-            )
-            .unsqueeze(0)
-            .to(self._device)
-        )
 
         stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
         stopping_criteria = KeywordsStoppingCriteria([stop_str], self._tokenizer, input_ids)
