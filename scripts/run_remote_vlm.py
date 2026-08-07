@@ -132,32 +132,24 @@ def _stub_llava_mpt() -> None:
 
 
 def _bootstrap_llava() -> None:
-    try:
-        import importlib
+    import subprocess
 
-        importlib.import_module("llava")  # probe only
-        already = True
-    except ImportError:
-        already = False
-
-    if not already:
-        import subprocess
-
-        print(f"[run_remote_vlm] Installing llava (--no-deps) from {QUILT_LLAVA_GIT}")
-        cmd = [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--no-deps",
-            "--no-cache-dir",
-            QUILT_LLAVA_GIT,
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        print(res.stdout)
-        if res.returncode != 0:
-            print(res.stderr, file=sys.stderr)
-            raise RuntimeError(f"pip install of llava failed (exit {res.returncode})")
+    print(f"[run_remote_vlm] Installing pinned llava fork: {QUILT_LLAVA_GIT}")
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-deps",
+        "--no-cache-dir",
+        "--force-reinstall",
+        QUILT_LLAVA_GIT,
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    print(res.stdout)
+    if res.returncode != 0:
+        print(res.stderr, file=sys.stderr)
+        raise RuntimeError(f"pip install of llava failed (exit {res.returncode})")
 
     import sys as _sys
 

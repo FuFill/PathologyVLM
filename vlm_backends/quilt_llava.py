@@ -51,30 +51,24 @@ def _stub_llava_mpt() -> None:
 
 
 def _bootstrap_llava() -> None:
-    try:
-        import importlib
+    import subprocess
 
-        importlib.import_module("llava")
-        already = True
-    except ImportError:
-        already = False
-
-    if not already:
-        import subprocess
-
-        cmd = [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--no-deps",
-            "--no-cache-dir",
-            QUILT_LLAVA_GIT,
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            print(res.stderr, file=sys.stderr)
-            raise RuntimeError(f"pip install of llava failed (exit {res.returncode})")
+    print(f"[quilt_llava] Installing pinned llava fork: {QUILT_LLAVA_GIT}")
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-deps",
+        "--no-cache-dir",
+        "--force-reinstall",
+        QUILT_LLAVA_GIT,
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    print(res.stdout)
+    if res.returncode != 0:
+        print(res.stderr, file=sys.stderr)
+        raise RuntimeError(f"pip install of llava failed (exit {res.returncode})")
 
     for key in list(sys.modules):
         if key == "llava" or key.startswith("llava."):
@@ -87,6 +81,8 @@ def _bootstrap_llava() -> None:
 
     importlib.invalidate_caches()
     import llava  # noqa: F401
+
+    print(f"[quilt_llava] llava importable from: {llava.__file__}")
 
 
 def set_seed(seed: int) -> None:
@@ -122,6 +118,7 @@ class QuiltLLaVABackend(VLMBackend):
         self._image_processor = None
         self._device = None
         self._revision = None
+        self._diagnostics_printed = False
 
     @staticmethod
     def model_id() -> str:
@@ -130,8 +127,15 @@ class QuiltLLaVABackend(VLMBackend):
     def load(self, load_4bit: bool = False, revision: Optional[str] = None) -> None:
         _bootstrap_llava()
 
+        import transformers
+
         from llava.mm_utils import get_model_name_from_path
         from llava.model.builder import load_pretrained_model
+
+        print(
+            f"[quilt_llava] env: torch={torch.__version__} "
+            f"transformers={transformers.__version__} cuda={torch.cuda.is_available()}"
+        )
 
         model_name = get_model_name_from_path(self.model_id())
         self._tokenizer, self._model, self._image_processor, context_len = (
@@ -148,6 +152,36 @@ class QuiltLLaVABackend(VLMBackend):
         self._model.eval()
         self._device = next(self._model.parameters()).device
         self._revision = revision or getattr(self._model.config, '_commit_hash', None)
+
+        state_keys = list(self._model.state_dict().keys())
+        n_double = sum(
+            1 for k in state_keys
+            if k.startswith("model.vision_tower.vision_tower.vision_model")
+        )
+        n_single = sum(
+            1 for k in state_keys
+            if k.startswith("model.vision_tower.vision_model")
+            and not k.startswith("model.vision_tower.vision_tower")
+        )
+        n_vt_total = sum(1 for k in state_keys if k.startswith("model.vision_tower"))
+        print(
+            f"[quilt_llava] vision tower keys in model: "
+            f"double_vision_tower={n_double} single_vision_tower={n_single} "
+            f"vision_tower_total={n_vt_total}"
+        )
+        if n_double == 0 and n_vt_total > 0:
+            raise RuntimeError(
+                "[quilt_llava] vision tower structure mismatch: checkpoint uses "
+                "model.vision_tower.vision_tower.vision_model.* (double) but loaded "
+                "model has single-level vision tower -> weights were silently dropped. "
+                "The pinned aldraus fork is NOT what got imported. "
+                "Check llava.__file__ and the pip install log above."
+            )
+        print(
+            f"[quilt_llava] Loaded OK. context_len={context_len} "
+            f"image_size={getattr(self._image_processor, 'size', None)} "
+            f"device={self._device} dtype={next(self._model.parameters()).dtype}"
+        )
 
     def generate(
         self,
@@ -198,6 +232,30 @@ class QuiltLLaVABackend(VLMBackend):
             image_tensor = [t.to(self._device, dtype=torch.float16) for t in image_tensor]
         else:
             image_tensor = image_tensor.to(self._device, dtype=torch.float16)
+
+        if not self._diagnostics_printed:
+            self._diagnostics_printed = True
+            try:
+                if isinstance(image_tensor, list):
+                    diag_t = image_tensor[0]
+                else:
+                    diag_t = image_tensor
+                print(
+                    f"[quilt_llava] pixel_values: dtype={diag_t.dtype} "
+                    f"shape={tuple(diag_t.shape)} min={diag_t.min().item():.4f} "
+                    f"max={diag_t.max().item():.4f} mean={diag_t.mean().item():.4f} "
+                    f"has_nan={bool(torch.isnan(diag_t).any().item())}"
+                )
+                with torch.inference_mode():
+                    image_features = self._model.encode_images(diag_t)
+                print(
+                    f"[quilt_llava] image_features: dtype={image_features.dtype} "
+                    f"shape={tuple(image_features.shape)} min={image_features.min().item():.4f} "
+                    f"max={image_features.max().item():.4f} mean={image_features.mean().item():.4f} "
+                    f"has_nan={bool(torch.isnan(image_features).any().item())}"
+                )
+            except Exception as exc:  # noqa: BLE001 — diagnostics must not break inference
+                print(f"[quilt_llava] WARNING: image diagnostics failed: {type(exc).__name__}: {exc}")
 
         input_ids = (
             tokenizer_image_token(
