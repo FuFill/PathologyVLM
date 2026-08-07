@@ -119,12 +119,15 @@ class MedSigLIPBackend(VLMBackend):
         mean_tumor = sum(tumor_scores) / n_patches
         mean_normal = sum(normal_scores) / n_patches
 
-        if mean_tumor > mean_normal + 0.02:
+        if self._diag_printed < 20:
+            print(
+                f"[med_siglip] mean_tumor={mean_tumor:.4f} mean_normal={mean_normal:.4f} "
+                f"diff={mean_tumor - mean_normal:+.4f}"
+            )
+
+        if mean_tumor >= mean_normal:
             return "FINAL ANSWER: A"
-        elif mean_normal > mean_tumor + 0.02:
-            return "FINAL ANSWER: B"
-        else:
-            return "FINAL ANSWER: C"
+        return "FINAL ANSWER: B"
 
     def config_snapshot(self) -> dict:
         import transformers
