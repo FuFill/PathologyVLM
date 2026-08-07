@@ -221,7 +221,7 @@ class QuiltLLaVABackend(VLMBackend):
             user_msg = DEFAULT_IMAGE_TOKEN + "\n" + prompt
 
         conv.append_message(conv.roles[0], user_msg)
-        conv.append_message(conv.roles[1], "{")
+        conv.append_message(conv.roles[1], None)
         full_prompt = conv.get_prompt()
 
         class _ImgCfg:

@@ -56,6 +56,8 @@ Decide:
 
 First, analyze the patch carefully. Then provide your FINAL ANSWER as a single letter (A, B, or C).
 
+Reply with exactly one letter: A, B, or C. Do not add any other text, explanations, or JSON.
+
 FINAL ANSWER:"""
 
 PROMPT_TEMPLATE_CONTEXT = """You are a pathology AI analyzing H&E stained lymph node tissue patches.
@@ -112,9 +114,34 @@ def _parse_answer(raw: str) -> tuple[str, bool]:
     m = re.search(r'\bANSWER\s*:\s*([ABC])', text)
     if m:
         return m.group(1), True
-    m = re.search(r'\b([ABC])\b', text)
-    if m:
-        return m.group(1), True
+
+    # Quilt-LLaVA emits Quilt-VQA-style JSON; try to read a decision key from it.
+    try:
+        json_blob = raw[raw.find("{"):]
+        if json_blob:
+            depth = 0
+            end = -1
+            for i, ch in enumerate(json_blob):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            if end > 0:
+                obj = json.loads(json_blob[:end])
+                for key in ("final_answer", "answer", "decision", "final", "label"):
+                    val = str(obj.get(key, "")).strip().upper()
+                    if val in ("A", "B", "C"):
+                        return val, True
+    except Exception:
+        pass
+
+    # Fallback: take the LAST standalone A/B/C (the decision comes at the end).
+    letters = re.findall(r'\b([ABC])\b', text)
+    if letters:
+        return letters[-1], True
     return text[:50], False
 
 
@@ -232,7 +259,8 @@ def _run_model(
     cache_dir: Path,
     seed: int,
     temperature: float,
-    load_4bit: bool = False,
+    load_4bit: bool,
+    max_patches: int = 0,
 ) -> list[dict]:
     print(f"\n{'='*60}")
     print(f"Running model: {model_key} ({backend.model_id()})")
@@ -290,7 +318,7 @@ def _run_model(
             ans, valid = _parse_answer(raw)
 
             if pi < 3 or not valid:
-                trunc = raw[:300].replace("\n", "\\n")
+                trunc = raw[:2000].replace("\n", "\\n")
                 print(f"    RAW[{pi+1}]: {trunc}")
 
             all_records.append({
@@ -410,6 +438,10 @@ def main() -> int:
     parser.add_argument("--cache_dir", default="/tmp/vlm_patch_cache")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--max_patches", type=int, default=0,
+        help="Debug: run only the first N patches (0 = all)",
+    )
     args = parser.parse_args()
 
     registry_path = _resolve_registry(args.registry_csv)
@@ -512,6 +544,7 @@ def main() -> int:
                 seed=args.seed,
                 temperature=args.temperature,
                 load_4bit=load_4bit,
+                max_patches=args.max_patches,
             )
             all_results[model_key] = results
         except Exception as exc:
