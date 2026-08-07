@@ -46,7 +46,12 @@ class MedSigLIPBackend(VLMBackend):
     def get_image_embedding(self, image: Image.Image) -> torch.Tensor:
         if self._model is None or self._processor is None:
             raise RuntimeError("Model not loaded. Call load() first.")
-        inputs = self._processor(images=image, return_tensors="pt").to(self._model.device)
+        model_dtype = next(self._model.parameters()).dtype
+        inputs = self._processor(images=image, return_tensors="pt")
+        inputs = {
+            k: (v.to(self._model.device, model_dtype) if v.is_floating_point() else v.to(self._model.device))
+            for k, v in inputs.items()
+        }
         with torch.inference_mode():
             outputs = self._model.get_image_features(**inputs)
         return outputs
@@ -54,9 +59,12 @@ class MedSigLIPBackend(VLMBackend):
     def get_text_embedding(self, text: str) -> torch.Tensor:
         if self._model is None or self._processor is None:
             raise RuntimeError("Model not loaded. Call load() first.")
-        inputs = self._processor(text=text, return_tensors="pt", padding=True).to(
-            self._model.device
-        )
+        model_dtype = next(self._model.parameters()).dtype
+        inputs = self._processor(text=text, return_tensors="pt", padding=True)
+        inputs = {
+            k: (v.to(self._model.device, model_dtype) if v.is_floating_point() else v.to(self._model.device))
+            for k, v in inputs.items()
+        }
         with torch.inference_mode():
             outputs = self._model.get_text_features(**inputs)
         return outputs
