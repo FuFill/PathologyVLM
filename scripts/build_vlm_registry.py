@@ -639,6 +639,9 @@ def main() -> int:
 
     _print_summary(registry)
 
+    tid = os.environ.get("CLEARML_TASK_ID", "")
+    suffix = f"_{tid}" if tid else ""
+
     csv_key = f"{args.output_s3_prefix}/patch_registry.csv"
     parquet_key = f"{args.output_s3_prefix}/patch_registry.parquet"
 
@@ -660,15 +663,21 @@ def main() -> int:
     csv_url = upload_to_s3(local_csv, csv_key)
     print(f"\n[registry] Uploaded:")
     print(f"  CSV:     {csv_url}")
+    if suffix:
+        run_csv_url = upload_to_s3(local_csv, f"{args.output_s3_prefix}/patch_registry{suffix}.csv")
+        print(f"  CSV:     {run_csv_url} (run copy)")
     if local_parquet:
         parquet_url = upload_to_s3(local_parquet, parquet_key)
         print(f"  Parquet: {parquet_url}")
+        if suffix:
+            run_pq_url = upload_to_s3(local_parquet, f"{args.output_s3_prefix}/patch_registry{suffix}.parquet")
+            print(f"  Parquet: {run_pq_url} (run copy)")
 
     if not args.skip_oracle_cleanup and not oracle_dropped.empty:
         report_local = os.path.join(tmp_dir, "oracle_cleanup_report.csv")
         oracle_dropped.to_csv(report_local, index=False)
         report_url = upload_to_s3(
-            report_local, f"{args.output_s3_prefix}/oracle_cleanup_report.csv"
+            report_local, f"{args.output_s3_prefix}/oracle_cleanup_report{suffix}.csv"
         )
         print(f"  Cleanup report: {report_url}")
 

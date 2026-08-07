@@ -480,10 +480,12 @@ def main() -> int:
                 print(f"      >>> C17 full run will NOT be meaningful for {model_key}")
 
     summary_df = pd.DataFrame(rows)
+    tid = os.environ.get("CLEARML_TASK_ID", "")
+    suffix = f"_{tid}" if tid else ""
     if args.output:
         output_path = Path(args.output)
     else:
-        output_path = Path(tempfile.gettempdir()) / "c16_vlm_benchmark.json"
+        output_path = Path(tempfile.gettempdir()) / f"c16_vlm_benchmark{suffix}.json"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 

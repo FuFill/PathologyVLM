@@ -37,7 +37,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.s3_utils import read_csv_from_s3, upload_to_s3
+from src.s3_utils import get_s3_client, read_csv_from_s3, upload_to_s3
 
 REGISTRY_CSV_DEFAULT = (
     "s3://pershin-medailab/Pathomorphology/CAMELYON/"
@@ -264,12 +264,15 @@ def main() -> int:
     out_dir = Path(args.out_dir) if args.out_dir else jsonl_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    tid = os.environ.get("CLEARML_TASK_ID", "")
+    suffix = f"_{tid}" if tid else ""
+
     summary_df = pd.DataFrame(records)
-    csv_path = out_dir / "evaluation_summary.csv"
+    csv_path = out_dir / f"evaluation_summary{suffix}.csv"
     summary_df.to_csv(csv_path, index=False)
     print(f"\n[evaluate] wrote {csv_path}")
 
-    md_path = out_dir / "evaluation_report.md"
+    md_path = out_dir / f"evaluation_report{suffix}.md"
     lines = [
         "# VLM run re-evaluation vs fixed registry",
         "",
