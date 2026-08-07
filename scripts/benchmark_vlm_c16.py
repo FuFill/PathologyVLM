@@ -327,6 +327,70 @@ def _resolve_registry(path: str) -> str:
     return path
 
 
+MIG_PROFILES = ("7g.79gb", "4g.40gb", "3g.40gb", "2g.20gb", "1g.10gb")
+
+
+def _print_nvidia_smi() -> None:
+    try:
+        res = subprocess.run(
+            ["nvidia-smi"], capture_output=True, text=True, timeout=30
+        )
+        print(res.stdout or res.stderr or "(no output)")
+    except Exception as exc:
+        print(f"nvidia-smi failed: {exc}")
+
+
+def _mig_enabled_no_instances() -> bool:
+    try:
+        res = subprocess.run(
+            ["nvidia-smi"], capture_output=True, text=True, timeout=30
+        )
+        smi = res.stdout or ""
+    except Exception as exc:
+        print(f"[benchmark] nvidia-smi failed: {exc}")
+        return False
+    return "Enabled" in smi and "No MIG devices found" in smi
+
+
+def _provision_mig() -> bool:
+    """Try to create a MIG instance from inside the container (requires
+    NVIDIA_MIG_CONFIG_DEVICES=all in docker args). Sets CUDA_VISIBLE_DEVICES
+    to the new MIG UUID. Must run BEFORE the first torch.cuda call, because
+    cuInit reads CUDA_VISIBLE_DEVICES once.
+    """
+    for profile in MIG_PROFILES:
+        print(f"[benchmark] MIG enabled with no instances - trying profile {profile}...")
+        try:
+            r = subprocess.run(
+                ["nvidia-smi", "mig", "-cgi", profile, "-C"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            print((r.stdout or r.stderr or "").strip()[:400])
+            if r.returncode == 0:
+                break
+        except Exception as exc:
+            print(f"  nvidia-smi mig failed: {exc}")
+    else:
+        print("[benchmark] MIG provisioning failed for all profiles")
+        return False
+
+    try:
+        res = subprocess.run(
+            ["nvidia-smi", "-L"], capture_output=True, text=True, timeout=30
+        )
+        for line in (res.stdout or "").splitlines():
+            if "MIG" in line and "UUID:" in line:
+                uuid = line.split("UUID:")[-1].strip().split(")")[0].strip()
+                os.environ["CUDA_VISIBLE_DEVICES"] = uuid
+                print(f"[benchmark] CUDA_VISIBLE_DEVICES={uuid}")
+                return True
+    except Exception as exc:
+        print(f"  failed to read MIG UUID: {exc}")
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Benchmark VLM models on C16 control patches"
@@ -401,31 +465,33 @@ def main() -> int:
         print(f"[benchmark] WARNING: unknown BENCHMARK_DTYPE={dtype!r}, using bf16")
         load_4bit = False
 
+    cuda_models = [
+        c for c in model_configs
+        if getattr(getattr(importlib.import_module(c[1]), c[2]), "requires_cuda", False)
+    ]
+    if cuda_models and _mig_enabled_no_instances():
+        print("[benchmark] MIG enabled but no MIG instances - attempting provisioning...")
+        print("--- nvidia-smi output (before) ---")
+        _print_nvidia_smi()
+        provisioned = _provision_mig()
+        print("--- nvidia-smi output (after) ---")
+        _print_nvidia_smi()
+        print(f"[benchmark] MIG provisioning success: {provisioned}")
+
     cuda_ok = torch.cuda.is_available()
     print(f"[benchmark] CUDA available: {cuda_ok}")
     if cuda_ok:
         try:
             print(f"[benchmark] CUDA device: {torch.cuda.get_device_name(0)}")
+            props = torch.cuda.get_device_properties(0)
+            print(f"[benchmark] CUDA VRAM: {props.total_memory / 1e9:.1f} GB")
         except Exception:
             pass
 
-    cuda_models = [
-        c for c in model_configs
-        if getattr(getattr(importlib.import_module(c[1]), c[2]), "requires_cuda", False)
-    ]
     if cuda_models and not cuda_ok:
         print("[benchmark] ERROR: selected models require CUDA but no GPU is available "
               f"inside the container: {[c[0] for c in cuda_models]}")
         print("[benchmark] Failing fast (expected: every agent has a working CUDA GPU).")
-        print("--- nvidia-smi output ---")
-        try:
-            res = subprocess.run(
-                ["nvidia-smi"], capture_output=True, text=True, timeout=30
-            )
-            print(res.stdout or res.stderr or "(no output)")
-        except Exception as exc:
-            print(f"nvidia-smi failed: {exc}")
-        print("-------------------------")
         return 2
 
     all_results = {}
