@@ -35,9 +35,10 @@ class MedSigLIPBackend(VLMBackend):
             MEDSIGLIP_MODEL_ID,
             revision=revision,
             torch_dtype=torch.float16,
-            device_map="auto" if torch.cuda.is_available() else None,
             token=True,
         )
+        if torch.cuda.is_available():
+            self._model = self._model.to("cuda")
         self._model.eval()
         self._device = next(self._model.parameters()).device
         self._revision = revision or getattr(self._model.config, '_commit_hash', None)
