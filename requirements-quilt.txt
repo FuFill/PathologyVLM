@@ -10,6 +10,7 @@ sentencepiece==0.2.0
 protobuf==4.25.3
 bitsandbytes==0.46.1
 huggingface_hub==0.20.3
+hf-transfer>=1.4.3
 datasets==2.16.1
 pillow==10.3.0
 numpy==1.26.4
