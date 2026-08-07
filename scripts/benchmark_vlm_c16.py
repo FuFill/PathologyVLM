@@ -317,9 +317,8 @@ def _run_model(
 
             ans, valid = _parse_answer(raw)
 
-            if pi < 3 or not valid:
-                trunc = raw[:2000].replace("\n", "\\n")
-                print(f"    RAW[{pi+1}]: {trunc}")
+            trunc = raw[:1000].replace("\n", "\\n")
+            print(f"    RAW[{pi+1}]: {trunc}")
 
             all_records.append({
                 "model": model_key,
