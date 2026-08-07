@@ -35,6 +35,8 @@ def _pad_to_siglip(img: Image.Image, target: int = _siglip_target_size) -> Image
 
 
 class MedGemmaBackend(VLMBackend):
+    requires_cuda = True
+
     def __init__(self) -> None:
         self._model = None
         self._processor = None

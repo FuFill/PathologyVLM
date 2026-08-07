@@ -75,8 +75,16 @@ class MedSigLIPBackend(VLMBackend):
         repetition_penalty: float = 1.0,
         seed: Optional[int] = None,
     ) -> str:
-        tumor_text = "tumor features, malignant cells, cancerous tissue in lymph node"
-        normal_text = "normal lymphoid tissue, benign lymphocytes, reactive follicle"
+        tumor_text = (
+            "This is a histopathology image of a lymph node showing tumor "
+            "cells, malignant lymphocytes, large atypical cells with high "
+            "nuclear-to-cytoplasmic ratio, and invasive growth."
+        )
+        normal_text = (
+            "This is a histopathology image of a lymph node showing normal "
+            "reactive lymphoid tissue, small mature lymphocytes, germinal "
+            "centers, and no malignant cells."
+        )
 
         tumor_emb = self.get_text_embedding(tumor_text)
         normal_emb = self.get_text_embedding(normal_text)
@@ -95,9 +103,9 @@ class MedSigLIPBackend(VLMBackend):
         mean_tumor = sum(tumor_scores) / n_patches
         mean_normal = sum(normal_scores) / n_patches
 
-        if mean_tumor > mean_normal + 0.05:
+        if mean_tumor > mean_normal + 0.02:
             return "FINAL ANSWER: A"
-        elif mean_normal > mean_tumor + 0.05:
+        elif mean_normal > mean_tumor + 0.02:
             return "FINAL ANSWER: B"
         else:
             return "FINAL ANSWER: C"

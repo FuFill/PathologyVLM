@@ -7,6 +7,8 @@ from PIL import Image
 
 
 class VLMBackend(abc.ABC):
+    requires_cuda: bool = False
+
     @staticmethod
     @abc.abstractmethod
     def model_id() -> str:

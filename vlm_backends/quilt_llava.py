@@ -114,6 +114,8 @@ class _SafeRepetitionPenaltyLogitsProcessor(torch.nn.Module):
 
 
 class QuiltLLaVABackend(VLMBackend):
+    requires_cuda = True
+
     def __init__(self) -> None:
         self._tokenizer = None
         self._model = None

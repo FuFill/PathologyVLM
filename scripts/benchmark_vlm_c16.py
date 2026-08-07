@@ -7,7 +7,14 @@ against tumor_mask_overlap ground truth.
 Models to compare:
   - MedGemma (generative)
   - Quilt-LLaVA (generative)
+  - Gemma-3-27B (generative)
   - MedSigLIP (contrastive control)
+
+Model selection via --model (or BENCHMARK_MODELS env var):
+  all / quilt_llava / med_gemma / gemma3_27b / gemma_family (med_gemma +
+  gemma3_27b) / med_siglip. MedSigLIP is always appended as control.
+
+Precision via BENCHMARK_DTYPE env var: bf16 (default) or 4bit.
 """
 
 from __future__ import annotations
@@ -17,6 +24,7 @@ import hashlib
 import importlib
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -28,6 +36,7 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import torch
 from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -223,14 +232,15 @@ def _run_model(
     cache_dir: Path,
     seed: int,
     temperature: float,
+    load_4bit: bool = False,
 ) -> list[dict]:
     print(f"\n{'='*60}")
     print(f"Running model: {model_key} ({backend.model_id()})")
     print(f"{'='*60}")
 
-    print(f"  Loading model weights...")
+    print(f"  Loading model weights... (load_4bit={load_4bit})")
     try:
-        backend.load(load_4bit=True)
+        backend.load(load_4bit=load_4bit)
     except Exception as exc:
         print(f"  [ERROR] Failed to load {model_key}: {exc}")
         import traceback
@@ -324,8 +334,8 @@ def main() -> int:
     parser.add_argument("--registry_csv", default=REGISTRY_CSV_DEFAULT)
     parser.add_argument(
         "--model",
-        default="quilt_llava",
-        choices=["all", "quilt_llava", "med_gemma", "med_siglip"],
+        default=os.environ.get("BENCHMARK_MODELS", "quilt_llava"),
+        choices=["all", "quilt_llava", "med_gemma", "med_siglip", "gemma3_27b", "gemma_family"],
     )
     parser.add_argument("--output", default="")
     parser.add_argument("--output_s3", default="mil/vlm_results/c16_benchmark")
@@ -371,12 +381,52 @@ def main() -> int:
         ("quilt_llava", "vlm_backends.quilt_llava", "QuiltLLaVABackend"),
         ("med_gemma", "vlm_backends.med_gemma", "MedGemmaBackend"),
         ("med_siglip", "vlm_backends.med_siglip", "MedSigLIPBackend"),
+        ("gemma3_27b", "vlm_backends.gemma3", "Gemma3Backend"),
     ]
+    family_models = {"med_gemma", "gemma3_27b"} if args.model == "gemma_family" else set()
     model_configs = [
         c for c in all_configs
-        if args.model in ("all", c[0]) or c[0] == "med_siglip"
+        if args.model in ("all", c[0]) or c[0] in family_models or c[0] == "med_siglip"
     ]
     print(f"[benchmark] Models to run: {[c[0] for c in model_configs]}")
+
+    dtype = os.environ.get("BENCHMARK_DTYPE", "bf16").strip().lower()
+    if dtype in ("bf16", "fp16", "16bit", ""):
+        load_4bit = False
+        print("[benchmark] Precision: bf16 (no quantization)")
+    elif dtype in ("4bit", "int4"):
+        load_4bit = True
+        print("[benchmark] Precision: 4bit nf4 (bitsandbytes)")
+    else:
+        print(f"[benchmark] WARNING: unknown BENCHMARK_DTYPE={dtype!r}, using bf16")
+        load_4bit = False
+
+    cuda_ok = torch.cuda.is_available()
+    print(f"[benchmark] CUDA available: {cuda_ok}")
+    if cuda_ok:
+        try:
+            print(f"[benchmark] CUDA device: {torch.cuda.get_device_name(0)}")
+        except Exception:
+            pass
+
+    cuda_models = [
+        c for c in model_configs
+        if getattr(getattr(importlib.import_module(c[1]), c[2]), "requires_cuda", False)
+    ]
+    if cuda_models and not cuda_ok:
+        print("[benchmark] ERROR: selected models require CUDA but no GPU is available "
+              f"inside the container: {[c[0] for c in cuda_models]}")
+        print("[benchmark] Failing fast (expected: every agent has a working CUDA GPU).")
+        print("--- nvidia-smi output ---")
+        try:
+            res = subprocess.run(
+                ["nvidia-smi"], capture_output=True, text=True, timeout=30
+            )
+            print(res.stdout or res.stderr or "(no output)")
+        except Exception as exc:
+            print(f"nvidia-smi failed: {exc}")
+        print("-------------------------")
+        return 2
 
     all_results = {}
     for model_key, module_path, class_name in model_configs:
@@ -391,6 +441,7 @@ def main() -> int:
                 cache_dir=cache_dir,
                 seed=args.seed,
                 temperature=args.temperature,
+                load_4bit=load_4bit,
             )
             all_results[model_key] = results
         except Exception as exc:
