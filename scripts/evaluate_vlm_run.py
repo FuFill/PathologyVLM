@@ -40,7 +40,16 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.s3_utils import read_csv_from_s3, upload_to_s3
 
 REGISTRY_CSV_DEFAULT = (
+    "s3://pershin-medailab/Pathomorphology/CAMELYON/"
     "mil/vlm_patches_registry/patch_registry.csv"
+)
+JSONL_DEFAULT = (
+    "s3://pershin-medailab/Pathomorphology/CAMELYON/"
+    "mil/vlm_results/c16_med_gemma/vlm_c16_med_gemma.jsonl"
+)
+LABELS_CSV_DEFAULT = (
+    "s3://pershin-medailab/Pathomorphology/CAMELYON/"
+    "mil/vlm_patches/c16_abmil_vlm_metadata_a50fbde29aa04e9d829a4580fd5c68b8.csv"
 )
 
 MODES = ("single", "separate", "context")
@@ -56,8 +65,10 @@ def _load_registry(path: str) -> pd.DataFrame:
 
 def _load_labels(path: str) -> dict[str, int]:
     if path.startswith("s3://"):
-        key = path.replace("s3://", "", 1).split("/", 1)[1]
-        df = read_csv_from_s3(key)
+        bucket, key = path.replace("s3://", "", 1).split("/", 1)
+        client = get_s3_client()
+        obj = client.get_object(Bucket=bucket, Key=key)
+        df = pd.read_csv(io.BytesIO(obj["Body"].read()))
     else:
         df = pd.read_csv(path)
     if "label" not in df.columns or "slide_id" not in df.columns:
@@ -82,14 +93,24 @@ def _fmt(v: float) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Re-evaluate vlm_pipeline JSONL vs registry")
-    ap.add_argument("--jsonl", required=True, help="vlm_pipeline output jsonl (local)")
+    ap.add_argument("--jsonl", default=JSONL_DEFAULT,
+                    help="vlm_pipeline output jsonl (local path or s3:// URL)")
     ap.add_argument("--registry_csv", default=REGISTRY_CSV_DEFAULT)
-    ap.add_argument("--labels_csv", default="", help="optional MIL metadata CSV with labels")
+    ap.add_argument("--labels_csv", default=LABELS_CSV_DEFAULT,
+                    help="MIL metadata CSV with slide_id/label (local or s3:// URL)")
     ap.add_argument("--out_dir", default="")
-    ap.add_argument("--upload_s3", default="", help="optional S3 prefix to upload results to")
+    ap.add_argument("--upload_s3", default="mil/vlm_results/c16_med_gemma_reeval",
+                    help="S3 prefix to upload results to ('' = no upload)")
     args = ap.parse_args()
 
     jsonl_path = Path(args.jsonl)
+    if args.jsonl.startswith("s3://"):
+        bucket, key = args.jsonl.replace("s3://", "", 1).split("/", 1)
+        client = get_s3_client()
+        obj = client.get_object(Bucket=bucket, Key=key)
+        jsonl_path = Path(tempfile.gettempdir()) / Path(key).name
+        jsonl_path.write_bytes(obj["Body"].read())
+        print(f"[evaluate] downloaded {args.jsonl} to {jsonl_path}")
     if not jsonl_path.exists():
         print(f"[evaluate] ERROR: jsonl not found: {jsonl_path}")
         return 1

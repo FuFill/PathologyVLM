@@ -567,9 +567,12 @@ def main() -> int:
                         help="Datasets to include")
     parser.add_argument("--local_archive_dir", default="",
                         help="Local path to extracted archive (e.g. c16_abmil_vlm_patches_*/vlm_patches)")
-    parser.add_argument("--use_s3_images", action="store_true",
+    parser.add_argument("--use_s3_images", action=argparse.BooleanOptionalAction,
+                        default=True,
                         help="Download patch images from S3 for tissue_fraction "
-                             "(each archive is downloaded and extracted only once)")
+                             "(each archive is downloaded and extracted only once). "
+                             "Default: True; use --no-use-s3-images to merge "
+                             "tissue_fraction from the previous registry instead")
     parser.add_argument("--cache_dir", default="/tmp/vlm_archive_cache",
                         help="Local cache dir for downloaded patch archives (used with --use_s3_images)")
     parser.add_argument("--previous_registry_csv", default="",

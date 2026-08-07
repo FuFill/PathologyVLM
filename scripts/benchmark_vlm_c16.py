@@ -324,7 +324,7 @@ def main() -> int:
     parser.add_argument("--registry_csv", default=REGISTRY_CSV_DEFAULT)
     parser.add_argument(
         "--model",
-        default="med_gemma",
+        default="quilt_llava",
         choices=["all", "quilt_llava", "med_gemma", "med_siglip"],
     )
     parser.add_argument("--output", default="")
