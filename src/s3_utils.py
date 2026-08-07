@@ -42,12 +42,8 @@ def s3_key(path: str) -> str:
 def read_csv_from_s3(s3_path: str) -> pd.DataFrame:
     client = get_s3_client()
     key = s3_key(s3_path)
-    tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
-    try:
-        client.download_file(_BUCKET, key, tmp.name)
-        return pd.read_csv(tmp.name)
-    finally:
-        os.unlink(tmp.name)
+    obj = client.get_object(Bucket=_BUCKET, Key=key)
+    return pd.read_csv(io.BytesIO(obj["Body"].read()))
 
 
 def upload_to_s3(local_path: str, s3_path: str) -> str:

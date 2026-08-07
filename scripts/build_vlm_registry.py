@@ -21,10 +21,19 @@ For each physical patch saves:
   - context_set (standard/diverse) for group labelling
   - random_seed (0 for non-random, seed value for random)
 
-Tumor GT is recomputed from the Camelyon annotation XMLs on S3
-(C16: 16/{training|testing}/annotations/{slide}.xml by split column,
-C17: 17/annotations/{slide_id}.xml). Use --skip_tumor_gt_recompute to
-keep the inherited tile_in_mask values instead.
+Tumor GT is recomputed from the Camelyon annotation XMLs on S3.
+XML resolution is based on the slide-id pattern, not the dataset name:
+  - patient_*  -> C17: 17/annotations/{slide_id}.xml
+  - test_*/normal_* -> C16: 16/{training|testing}/annotations/{slide}.xml
+    with the trailing "_tile_embeddings" suffix stripped from slide_id.
+Use --skip_tumor_gt_recompute to keep the inherited tile_in_mask values instead.
+
+After the recompute, oracle groups are cleaned against the recomputed mask:
+oracle_tumor rows with mask != 1 and oracle_non_tumor rows with mask != 0 are
+dropped (see --skip_oracle_cleanup and the uploaded oracle_cleanup_report.csv).
+
+tissue_fraction via --use_s3_images now caches each patch archive locally
+(see --cache_dir) so every tar.gz is downloaded and extracted only once.
 """
 
 from __future__ import annotations
@@ -37,6 +46,8 @@ import sys
 import tarfile
 import tempfile
 import xml.etree.ElementTree as ET
+from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -47,7 +58,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.s3_utils import get_s3_client, read_csv_from_s3, upload_to_s3
+from src.s3_utils import (
+    get_minio_path_components,
+    get_s3_client,
+    read_csv_from_s3,
+    upload_to_s3,
+)
 
 MINIO_BUCKET = "pershin-medailab"
 MINIO_PREFIX = "Pathomorphology/CAMELYON"
@@ -155,35 +171,52 @@ def _load_metadata_csv(name: str, s3_path: str) -> pd.DataFrame:
     return result
 
 
-def _extract_png_from_s3(minio_path: str) -> Image.Image | None:
-    if "!" not in minio_path:
-        return None
-    tar_part, internal = minio_path.split("!", 1)
-    tar_part = tar_part.replace("s3://", "").split("/", 1)[1] if "s3://" in tar_part else tar_part
-    tar_part = tar_part.lstrip("/")
-    internal = internal.lstrip("/")
-
+def _download_archive(tar_key: str, cache_dir: Path) -> Optional[Path]:
+    local = cache_dir / tar_key.replace("/", "_")
+    if local.exists() and local.stat().st_size > 0:
+        print(f"    archive cached: {local.name}")
+        return local
+    tmp = local.with_name(local.name + ".part")
     client = get_s3_client()
     try:
-        obj = client.get_object(Bucket="pershin-medailab", Key=tar_part)
-        body = obj["Body"].read()
-        with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as tf:
-            try:
-                member = tf.getmember(internal)
-            except KeyError:
-                alt = internal.replace("vlm_patches/", "vlm_patches_standard/")
-                member = tf.getmember(alt)
-            f = tf.extractfile(member)
-            if f is None:
-                return None
-            img = Image.open(io.BytesIO(f.read()))
+        client.download_file(MINIO_BUCKET, tar_key, str(tmp))
+        tmp.replace(local)
+        print(f"    downloaded archive: {local.name} ({local.stat().st_size / 1e9:.2f} GB)")
+        return local
+    except Exception as exc:
+        print(f"    WARNING: archive download failed {tar_key}: {exc}")
+        if tmp.exists():
+            tmp.unlink()
+        return None
+
+
+def _extract_archive_once(archive_path: Path, extract_dir: Path) -> None:
+    if extract_dir.exists() and any(extract_dir.iterdir()):
+        return
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive_path, "r:gz") as tf:
+        kwargs = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+        tf.extractall(extract_dir, **kwargs)
+    print(f"    extracted: {archive_path.name} -> {extract_dir}")
+
+
+def _read_extracted(relative_path: str, extract_dir: Path) -> Image.Image | None:
+    candidates = [extract_dir / relative_path]
+    alt = relative_path.replace("vlm_patches/", "vlm_patches_standard/")
+    if alt != relative_path:
+        candidates.append(extract_dir / alt)
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            img = Image.open(candidate)
             img.load()
             if img.mode != "RGB":
                 img = img.convert("RGB")
             return img
-    except Exception as exc:
-        print(f"    WARNING: extract failed for {minio_path}: {exc}")
-        return None
+        except Exception:
+            return None
+    return None
 
 
 def _extract_png_local(relative_path: str, local_archive_dir: Path) -> Image.Image | None:
@@ -225,24 +258,55 @@ def _compute_tissue_fractions(
     df: pd.DataFrame,
     local_dir: Path | None,
     use_s3: bool,
+    archive_cache_dir: Path | None,
 ) -> pd.DataFrame:
     print(f"  Computing tissue_fraction for {len(df)} patches...")
-    fractions = []
     total = len(df)
-    for idx, (_, row) in enumerate(df.iterrows()):
-        if idx % 500 == 0:
-            print(f"    [{idx}/{total}]")
-        img = None
-        if local_dir:
-            img = _extract_png_local(row["relative_path"], local_dir)
-        if img is None and use_s3:
-            img = _extract_png_from_s3(row["minio_path"])
-        if img is not None:
-            fractions.append(_compute_tissue_fraction(img))
-        else:
-            fractions.append(0.0)
+    fractions: list[float] = [np.nan] * total
+    rows = list(df.iterrows())
+
+    if local_dir is not None:
+        for idx, (_, row) in enumerate(rows):
+            if idx % 500 == 0:
+                print(f"    [{idx}/{total}]")
+            img = _extract_png_local(str(row.get("relative_path", "")), local_dir)
+            if img is not None:
+                fractions[idx] = _compute_tissue_fraction(img)
+
+    elif use_s3 and archive_cache_dir is not None:
+        archive_cache_dir.mkdir(parents=True, exist_ok=True)
+        by_archive: dict[str, list[int]] = defaultdict(list)
+        for idx, (_, row) in enumerate(rows):
+            try:
+                tar_key, _ = get_minio_path_components(str(row.get("minio_path", "")))
+            except Exception:
+                tar_key = ""
+            by_archive[tar_key].append(idx)
+
+        for tar_key, idxs in sorted(by_archive.items(), key=lambda kv: -len(kv[1])):
+            if not tar_key:
+                continue
+            local_archive = _download_archive(tar_key, archive_cache_dir)
+            if local_archive is None:
+                continue
+            extract_dir = archive_cache_dir / "extracted" / tar_key.replace("/", "_")
+            _extract_archive_once(local_archive, extract_dir)
+            done = 0
+            for idx in idxs:
+                rel = str(rows[idx][1].get("relative_path", ""))
+                img = _read_extracted(rel, extract_dir)
+                if img is not None:
+                    fractions[idx] = _compute_tissue_fraction(img)
+                    done += 1
+            print(f"    archive {tar_key.split('/')[-1]}: {done}/{len(idxs)} patches")
+
+    else:
+        print("  No local dir / S3 images: tissue_fraction left for previous-registry merge")
+
     df["tissue_fraction"] = fractions
-    print(f"    Done. Mean tissue_fraction: {np.mean(fractions):.3f}")
+    n_ok = int(pd.notna(df["tissue_fraction"]).sum())
+    print(f"    Done. computed={n_ok}/{total}, missing={total - n_ok}, "
+          f"mean={df['tissue_fraction'].mean():.3f}")
     return df
 
 
@@ -296,21 +360,25 @@ def _patch_overlap_fraction(
 
 
 def _load_slide_polygons(client, dataset: str, slide: str, split: str):
-    if dataset in ("c16_native", "c17_to_c16"):
-        if str(slide).startswith("normal_"):
+    s = str(slide).strip()
+    if s.startswith("patient_"):
+        prefixes = ["17/annotations"]
+    else:
+        if s.startswith("normal_"):
             return None
         prefixes = ["16/testing/annotations", "16/training/annotations"]
         if split == "train":
             prefixes = ["16/training/annotations", "16/testing/annotations"]
-    else:
-        prefixes = ["17/annotations"]
+
+    slide_xml = s[: -len("_tile_embeddings")] if s.endswith("_tile_embeddings") else s
 
     for prefix in prefixes:
-        key = f"{MINIO_PREFIX}/{prefix}/{slide}.xml"
+        key = f"{MINIO_PREFIX}/{prefix}/{slide_xml}.xml"
         try:
             obj = client.get_object(Bucket=MINIO_BUCKET, Key=key)
             polygons = _parse_camelyon_xml(obj["Body"].read())
-            return polygons if polygons else None
+            if polygons:
+                return polygons
         except Exception:
             continue
     return None
@@ -391,7 +459,7 @@ def _build_output_registry(df: pd.DataFrame) -> pd.DataFrame:
     out["y"] = df["y"]
     out["tile_size"] = df["tile_size"]
     out["mag"] = df["mag"]
-    out["tissue_fraction"] = df["tissue_fraction"]
+    out["tissue_fraction"] = df.get("tissue_fraction", np.nan)
     out["tumor_mask_overlap"] = df["tumor_mask_overlap"]
     out["tumor_overlap_fraction"] = df.get("tumor_overlap_fraction", np.nan)
     out["tumor_mask_overlap_center"] = df.get("tumor_mask_overlap_center", np.nan)
@@ -423,20 +491,59 @@ def _generate_random_subsets(df: pd.DataFrame) -> pd.DataFrame:
 
     subsets = []
     for seed_val in RANDOM_SEEDS:
-        sampled = random_rows.groupby("slide_id", group_keys=False).apply(
-            lambda g: g.sample(n=min(len(g), 5), random_state=int(seed_val)),
-            include_groups=False,
-        )
-        sampled = sampled.reset_index(drop=True)
-        sampled["random_seed"] = seed_val
-        subsets.append(sampled)
+        sampled_parts = []
+        for _, group in random_rows.groupby("slide_id", group_keys=False):
+            n = min(len(group), 5)
+            part = group.sample(n=n, random_state=int(seed_val)).copy()
+            part["random_seed"] = seed_val
+            sampled_parts.append(part)
+        df_random = pd.concat(sampled_parts, ignore_index=True)
+        subsets.append(df_random)
 
     df_random = pd.concat(subsets, ignore_index=True)
     non_random["random_seed"] = 0
 
     combined = pd.concat([non_random, df_random], ignore_index=True)
-    print(f"  Random seeds {RANDOM_SEEDS}: {len(df_random)} random rows generated")
+    print(f"  Random seeds {RANDOM_SEEDS}: {len(df_random)} random rows generated "
+          f"(from {len(random_rows)} source rows)")
     return combined
+
+
+def _clean_oracle_groups(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Drop oracle_* rows whose recomputed mask label disagrees with their group.
+
+    oracle_tumor must have tumor_mask_overlap == 1, oracle_non_tumor must
+    have tumor_mask_overlap == 0. Returns (cleaned_df, dropped_df).
+    """
+    before = len(df)
+    bad_tumor = (df["selection_source"] == "oracle_tumor") & (df["tumor_mask_overlap"] != 1)
+    bad_non = (df["selection_source"] == "oracle_non_tumor") & (df["tumor_mask_overlap"] != 0)
+    drop_mask = bad_tumor | bad_non
+    dropped = df[drop_mask].copy()
+    cleaned = df[~drop_mask].copy()
+    n_t = int(bad_tumor.sum())
+    n_n = int(bad_non.sum())
+    print(f"  Oracle cleanup: oracle_tumor contaminated={n_t}, "
+          f"oracle_non_tumor contaminated={n_n}")
+    print(f"  Rows: {before} -> {len(cleaned)} ({before - len(cleaned)} dropped)")
+    return cleaned, dropped
+
+
+def _backup_s3_object(client, key: str) -> None:
+    """Copy an existing S3 object to a timestamped backup before overwrite."""
+    try:
+        client.head_object(Bucket=MINIO_BUCKET, Key=key)
+    except Exception:
+        return
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stem, suffix = key.rsplit(".", 1)
+    backup_key = f"{stem}_{stamp}.{suffix}"
+    client.copy_object(
+        Bucket=MINIO_BUCKET,
+        CopySource={"Bucket": MINIO_BUCKET, "Key": key},
+        Key=backup_key,
+    )
+    print(f"  Backed up {key} -> {backup_key}")
 
 
 def _print_summary(df: pd.DataFrame) -> None:
@@ -461,7 +568,10 @@ def main() -> int:
     parser.add_argument("--local_archive_dir", default="",
                         help="Local path to extracted archive (e.g. c16_abmil_vlm_patches_*/vlm_patches)")
     parser.add_argument("--use_s3_images", action="store_true",
-                        help="Download images from S3 for tissue_fraction (slow)")
+                        help="Download patch images from S3 for tissue_fraction "
+                             "(each archive is downloaded and extracted only once)")
+    parser.add_argument("--cache_dir", default="/tmp/vlm_archive_cache",
+                        help="Local cache dir for downloaded patch archives (used with --use_s3_images)")
     parser.add_argument("--previous_registry_csv", default="",
                         help="Previous registry CSV (s3:// or local) to merge tissue_fraction "
                              "from when tissue_fraction is not computed. "
@@ -471,9 +581,13 @@ def main() -> int:
     parser.add_argument("--skip_tumor_gt_recompute", action="store_true",
                         help="Keep inherited tile_in_mask as tumor_mask_overlap instead of "
                              "recomputing from annotation XMLs with the 20% area rule")
+    parser.add_argument("--skip_oracle_cleanup", action="store_true",
+                        help="Keep oracle_* rows even if their recomputed mask label "
+                             "disagrees with the group definition")
     args = parser.parse_args()
 
     local_dir = Path(args.local_archive_dir) if args.local_archive_dir else None
+    archive_cache_dir = Path(args.cache_dir) if args.use_s3_images else None
 
     all_dfs = []
     for name in args.datasets:
@@ -494,14 +608,16 @@ def main() -> int:
     combined["region_uid"] = combined.apply(_region_uid, axis=1)
     combined["is_diverse"] = combined["is_diverse"].fillna(0).astype(int)
 
+    combined = _deduplicate_coordinates(combined)
+
     if args.local_archive_dir or args.use_s3_images:
-        combined = _compute_tissue_fractions(combined, local_dir, args.use_s3_images)
+        combined = _compute_tissue_fractions(
+            combined, local_dir, args.use_s3_images, archive_cache_dir
+        )
     else:
         prev_csv = args.previous_registry_csv or f"{args.output_s3_prefix}/patch_registry.csv"
         combined = _merge_previous_tissue_fraction(combined, prev_csv)
         print(f"[registry] tissue_fraction merged from previous registry: {prev_csv}")
-
-    combined = _deduplicate_coordinates(combined)
 
     combined = _generate_random_subsets(combined)
 
@@ -510,12 +626,22 @@ def main() -> int:
     else:
         combined = _compute_tumor_gt(combined, get_s3_client())
 
+    oracle_dropped = pd.DataFrame()
+    if args.skip_oracle_cleanup:
+        print("[registry] Skipping oracle group cleanup")
+    else:
+        combined, oracle_dropped = _clean_oracle_groups(combined)
+
     registry = _build_output_registry(combined)
 
     _print_summary(registry)
 
     csv_key = f"{args.output_s3_prefix}/patch_registry.csv"
     parquet_key = f"{args.output_s3_prefix}/patch_registry.parquet"
+
+    client = get_s3_client()
+    _backup_s3_object(client, csv_key)
+    _backup_s3_object(client, parquet_key)
 
     tmp_dir = tempfile.gettempdir()
     local_csv = os.path.join(tmp_dir, "patch_registry.csv")
@@ -534,6 +660,14 @@ def main() -> int:
     if local_parquet:
         parquet_url = upload_to_s3(local_parquet, parquet_key)
         print(f"  Parquet: {parquet_url}")
+
+    if not args.skip_oracle_cleanup and not oracle_dropped.empty:
+        report_local = os.path.join(tmp_dir, "oracle_cleanup_report.csv")
+        oracle_dropped.to_csv(report_local, index=False)
+        report_url = upload_to_s3(
+            report_local, f"{args.output_s3_prefix}/oracle_cleanup_report.csv"
+        )
+        print(f"  Cleanup report: {report_url}")
 
     print(f"[registry] Done. {len(registry)} entries.")
     return 0
