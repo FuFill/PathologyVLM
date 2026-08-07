@@ -17,6 +17,7 @@ class MedSigLIPBackend(VLMBackend):
         self._model = None
         self._processor = None
         self._revision = None
+        self._diag_printed = 0
 
     @staticmethod
     def model_id() -> str:
@@ -94,6 +95,12 @@ class MedSigLIPBackend(VLMBackend):
             img_emb = self.get_image_embedding(img)
             sim_tumor = self.cosine_similarity(img_emb, tumor_emb)
             sim_normal = self.cosine_similarity(img_emb, normal_emb)
+            if self._diag_printed < 5:
+                self._diag_printed += 1
+                print(
+                    f"[med_siglip] sim_tumor={sim_tumor:.4f} sim_normal={sim_normal:.4f} "
+                    f"diff={sim_tumor - sim_normal:+.4f}"
+                )
             results.append((sim_tumor, sim_normal))
 
         n_patches = len(results)
