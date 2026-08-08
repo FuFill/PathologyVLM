@@ -320,6 +320,10 @@ def _run_model(
             trunc = raw[:1000].replace("\n", "\\n")
             print(f"    RAW[{pi+1}]: {trunc}")
 
+            metrics = {}
+            if hasattr(backend, "diagnostics"):
+                metrics = backend.diagnostics()
+
             all_records.append({
                 "model": model_key,
                 "patch_uid": str(patch.get("patch_uid", "")),
@@ -334,6 +338,7 @@ def _run_model(
                 "raw_response": raw,
                 "answer": ans,
                 "parse_valid": valid,
+                **({"metrics": metrics} if metrics else {}),
             })
             print(f"    [{pi+1}/{len(group_patches)}] answer: {ans}", end="\r")
 

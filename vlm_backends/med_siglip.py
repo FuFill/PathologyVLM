@@ -11,6 +11,26 @@ from .base import VLMBackend
 
 MEDSIGLIP_MODEL_ID = "google/medsiglip-448"
 
+TUMOR_TEXTS = [
+    "This is a histopathology image of a lymph node showing tumor "
+    "cells, malignant lymphocytes, large atypical cells with high "
+    "nuclear-to-cytoplasmic ratio, and invasive growth.",
+    "This histopathology image shows a lymph node with metastatic carcinoma.",
+    "histopathology image of a lymph node containing tumor cells",
+    "tumor",
+    "malignant",
+]
+
+NORMAL_TEXTS = [
+    "This is a histopathology image of a lymph node showing normal "
+    "reactive lymphoid tissue, small mature lymphocytes, germinal "
+    "centers, and no malignant cells.",
+    "This histopathology image shows a normal lymph node.",
+    "histopathology image of a normal lymph node",
+    "normal",
+    "benign",
+]
+
 
 class MedSigLIPBackend(VLMBackend):
     def __init__(self) -> None:
@@ -18,6 +38,7 @@ class MedSigLIPBackend(VLMBackend):
         self._processor = None
         self._revision = None
         self._diag_printed = 0
+        self._last_sims = None
 
     @staticmethod
     def model_id() -> str:
@@ -85,32 +106,38 @@ class MedSigLIPBackend(VLMBackend):
         repetition_penalty: float = 1.0,
         seed: Optional[int] = None,
     ) -> str:
-        tumor_text = (
-            "This is a histopathology image of a lymph node showing tumor "
-            "cells, malignant lymphocytes, large atypical cells with high "
-            "nuclear-to-cytoplasmic ratio, and invasive growth."
-        )
-        normal_text = (
-            "This is a histopathology image of a lymph node showing normal "
-            "reactive lymphoid tissue, small mature lymphocytes, germinal "
-            "centers, and no malignant cells."
-        )
-
-        tumor_emb = self.get_text_embedding(tumor_text)
-        normal_emb = self.get_text_embedding(normal_text)
+        tumor_embs = [self.get_text_embedding(t) for t in TUMOR_TEXTS]
+        normal_embs = [self.get_text_embedding(t) for t in NORMAL_TEXTS]
 
         results = []
         for img in images:
             img_emb = self.get_image_embedding(img)
-            sim_tumor = self.cosine_similarity(img_emb, tumor_emb)
-            sim_normal = self.cosine_similarity(img_emb, normal_emb)
+            sim_tumor_prompts = [
+                self.cosine_similarity(img_emb, te) for te in tumor_embs
+            ]
+            sim_normal_prompts = [
+                self.cosine_similarity(img_emb, ne) for ne in normal_embs
+            ]
+            sim_tumor = sim_tumor_prompts[0]
+            sim_normal = sim_normal_prompts[0]
+            sim_tumor_ens = sum(sim_tumor_prompts) / len(sim_tumor_prompts)
+            sim_normal_ens = sum(sim_normal_prompts) / len(sim_normal_prompts)
             if self._diag_printed < 5:
                 self._diag_printed += 1
                 print(
                     f"[med_siglip] sim_tumor={sim_tumor:.4f} sim_normal={sim_normal:.4f} "
                     f"diff={sim_tumor - sim_normal:+.4f}"
                 )
-            results.append((sim_tumor, sim_normal))
+            results.append(
+                (
+                    sim_tumor,
+                    sim_normal,
+                    sim_tumor_ens,
+                    sim_normal_ens,
+                    sim_tumor_prompts,
+                    sim_normal_prompts,
+                )
+            )
 
         n_patches = len(results)
         tumor_scores = [r[0] for r in results]
@@ -125,9 +152,30 @@ class MedSigLIPBackend(VLMBackend):
                 f"diff={mean_tumor - mean_normal:+.4f}"
             )
 
+        if len(results) == 1:
+            r = results[0]
+            self._last_sims = {
+                "sim_tumor": r[0],
+                "sim_normal": r[1],
+                "sim_tumor_ens": r[2],
+                "sim_normal_ens": r[3],
+                "sim_tumor_by_prompt": r[4],
+                "sim_normal_by_prompt": r[5],
+            }
+        else:
+            self._last_sims = {
+                "sim_tumor": mean_tumor,
+                "sim_normal": mean_normal,
+                "sim_tumor_ens": sum(r[2] for r in results) / n_patches,
+                "sim_normal_ens": sum(r[3] for r in results) / n_patches,
+            }
+
         if mean_tumor >= mean_normal:
             return "FINAL ANSWER: A"
         return "FINAL ANSWER: B"
+
+    def diagnostics(self) -> dict:
+        return self._last_sims or {}
 
     def config_snapshot(self) -> dict:
         import transformers
