@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
@@ -10,6 +11,17 @@ from .base import VLMBackend
 
 
 MEDSIGLIP_MODEL_ID = "google/medsiglip-448"
+
+# Decision score calibrated on the C16 oracle groups (2026-08 run):
+#   s = 0.5 * sim(TUMOR_TEXTS[2]) + 0.5 * sim(TUMOR_TEXTS[3]) - sim(NORMAL_TEXTS[0])
+#   A if s > ABSTENTION_TAU, B if s < -ABSTENTION_TAU, C otherwise.
+# Oracle balanced acc 0.78 (tau=0: sens 0.96 / spec 0.61); at tau=0.005:
+# sens 0.86 / spec 0.52 with ~15% abstention. Long descriptive prompts alone
+# were anti-correlated (AUC ~0.38) - see the per-prompt diagnostics.
+DECISION_TUMOR_INDICES = (2, 3)
+DECISION_NORMAL_INDEX = 0
+ABSTENTION_TAU = 0.005
+FALLBACK_LOGIT_SCALE = 32.17
 
 TUMOR_TEXTS = [
     "This is a histopathology image of a lymph node showing tumor "
@@ -39,6 +51,7 @@ class MedSigLIPBackend(VLMBackend):
         self._revision = None
         self._diag_printed = 0
         self._last_sims = None
+        self._logit_scale = None
 
     @staticmethod
     def model_id() -> str:
@@ -63,6 +76,13 @@ class MedSigLIPBackend(VLMBackend):
         self._model.eval()
         self._device = next(self._model.parameters()).device
         self._revision = revision or getattr(self._model.config, '_commit_hash', None)
+        try:
+            ls = getattr(self._model, "logit_scale", None)
+            self._logit_scale = float(ls.exp()) if ls is not None else None
+        except Exception:
+            self._logit_scale = None
+        if self._logit_scale is None:
+            self._logit_scale = FALLBACK_LOGIT_SCALE
 
     def get_image_embedding(self, image: Image.Image) -> torch.Tensor:
         if self._model is None or self._processor is None:
@@ -122,10 +142,15 @@ class MedSigLIPBackend(VLMBackend):
             sim_normal = sim_normal_prompts[0]
             sim_tumor_ens = sum(sim_tumor_prompts) / len(sim_tumor_prompts)
             sim_normal_ens = sum(sim_normal_prompts) / len(sim_normal_prompts)
+            score = (
+                0.5 * sum(sim_tumor_prompts[i] for i in DECISION_TUMOR_INDICES)
+                - sim_normal_prompts[DECISION_NORMAL_INDEX]
+            )
             if self._diag_printed < 5:
                 self._diag_printed += 1
                 print(
-                    f"[med_siglip] sim_tumor={sim_tumor:.4f} sim_normal={sim_normal:.4f} "
+                    f"[med_siglip] score={score:.4f} "
+                    f"sim_tumor={sim_tumor:.4f} sim_normal={sim_normal:.4f} "
                     f"diff={sim_tumor - sim_normal:+.4f}"
                 )
             results.append(
@@ -136,6 +161,7 @@ class MedSigLIPBackend(VLMBackend):
                     sim_normal_ens,
                     sim_tumor_prompts,
                     sim_normal_prompts,
+                    score,
                 )
             )
 
@@ -145,11 +171,12 @@ class MedSigLIPBackend(VLMBackend):
 
         mean_tumor = sum(tumor_scores) / n_patches
         mean_normal = sum(normal_scores) / n_patches
+        mean_score = sum(r[6] for r in results) / n_patches
 
         if self._diag_printed < 20:
             print(
                 f"[med_siglip] mean_tumor={mean_tumor:.4f} mean_normal={mean_normal:.4f} "
-                f"diff={mean_tumor - mean_normal:+.4f}"
+                f"mean_score={mean_score:+.4f} tau={ABSTENTION_TAU:.3f}"
             )
 
         if len(results) == 1:
@@ -161,6 +188,7 @@ class MedSigLIPBackend(VLMBackend):
                 "sim_normal_ens": r[3],
                 "sim_tumor_by_prompt": r[4],
                 "sim_normal_by_prompt": r[5],
+                "score": r[6],
             }
         else:
             self._last_sims = {
@@ -168,11 +196,25 @@ class MedSigLIPBackend(VLMBackend):
                 "sim_normal": mean_normal,
                 "sim_tumor_ens": sum(r[2] for r in results) / n_patches,
                 "sim_normal_ens": sum(r[3] for r in results) / n_patches,
+                "score": mean_score,
             }
+        self._last_sims["tau"] = ABSTENTION_TAU
+        self._last_sims["logit_scale"] = self._logit_scale
+        self._last_sims["confidence"] = self._confidence(mean_score)
 
-        if mean_tumor >= mean_normal:
+        if mean_score > ABSTENTION_TAU:
             return "FINAL ANSWER: A"
-        return "FINAL ANSWER: B"
+        if mean_score < -ABSTENTION_TAU:
+            return "FINAL ANSWER: B"
+        return "FINAL ANSWER: C"
+
+    def _confidence(self, score: float) -> float:
+        e = self._logit_scale * score
+        if e > 20.0:
+            return 1.0
+        if e < -20.0:
+            return 0.0
+        return 1.0 / (1.0 + math.exp(-e))
 
     def diagnostics(self) -> dict:
         return self._last_sims or {}

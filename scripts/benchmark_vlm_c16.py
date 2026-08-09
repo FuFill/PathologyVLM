@@ -328,6 +328,7 @@ def _run_model(
                 "model": model_key,
                 "patch_uid": str(patch.get("patch_uid", "")),
                 "slide_id": str(patch.get("slide_id", "")),
+                "dataset": str(patch.get("dataset", "")),
                 "group": group_key,
                 "selection_source": str(patch.get("selection_source", "")),
                 "tile_in_mask": (

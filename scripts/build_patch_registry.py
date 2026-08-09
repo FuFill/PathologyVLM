@@ -94,8 +94,8 @@ def _load_and_normalise(name: str, csv_path: str) -> pd.DataFrame:
 
 def _deduplicate(df: pd.DataFrame) -> pd.DataFrame:
     before = len(df)
-    df = df.sort_values(["slide_id", "rank"])
-    df = df.drop_duplicates(subset=["slide_id", "x", "y", "tile_size"], keep="first")
+    df = df.sort_values(["slide_id", "source", "rank"])
+    df = df.drop_duplicates(subset=["slide_id", "source", "x", "y", "tile_size"], keep="first")
     after = len(df)
     print(f"[registry] Dedup: {before} -> {after} rows ({before - after} removed)")
     return df

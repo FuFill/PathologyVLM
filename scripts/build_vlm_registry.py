@@ -12,9 +12,11 @@ For each physical patch saves:
   - region_uid (unique physical area hash)
   - x, y, tile_size, mag
   - tissue_fraction
-  - tumor_mask_overlap (area fraction >= 20% of patch inside annotation polygons)
+  - tumor_mask_overlap (canonical: tile center inside annotation polygons —
+    the same rule the MIL pipeline uses for its tile_in_mask)
+  - tumor_mask_overlap_center (alias of the canonical center rule)
+  - tumor_mask_overlap_area20 (reference: >=20% of patch area inside polygons)
   - tumor_overlap_fraction (raw area fraction)
-  - tumor_mask_overlap_center (legacy: tile center inside polygons)
   - selection_source + rank
   - task_id + model_hash
   - relative_path inside archive
@@ -421,11 +423,12 @@ def _compute_tumor_gt(df: pd.DataFrame, client) -> pd.DataFrame:
         mask_center.append(int(center_inside))
 
     df["tumor_overlap_fraction"] = fracs
-    df["tumor_mask_overlap"] = mask20
+    df["tumor_mask_overlap"] = mask_center
     df["tumor_mask_overlap_center"] = mask_center
+    df["tumor_mask_overlap_area20"] = mask20
     print(f"    Done. Slides without XML: {n_missing}/{df['slide_id'].nunique()}.")
-    print(f"    Mask-pos (>=20% area): {sum(mask20)} ({sum(mask20) / max(len(df), 1):.1%}), "
-          f"center-pos: {sum(mask_center)} ({sum(mask_center) / max(len(df), 1):.1%})")
+    print(f"    Mask-pos (center rule): {sum(mask_center)} ({sum(mask_center) / max(len(df), 1):.1%}), "
+          f"area20-pos: {sum(mask20)} ({sum(mask20) / max(len(df), 1):.1%})")
     return df
 
 
@@ -463,6 +466,7 @@ def _build_output_registry(df: pd.DataFrame) -> pd.DataFrame:
     out["tumor_mask_overlap"] = df["tumor_mask_overlap"]
     out["tumor_overlap_fraction"] = df.get("tumor_overlap_fraction", np.nan)
     out["tumor_mask_overlap_center"] = df.get("tumor_mask_overlap_center", np.nan)
+    out["tumor_mask_overlap_area20"] = df.get("tumor_mask_overlap_area20", np.nan)
     out["selection_source"] = df["selection_source"]
     out["rank"] = df["rank"]
     out["task_id"] = df["task_id"]
@@ -477,11 +481,26 @@ def _build_output_registry(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _deduplicate_coordinates(df: pd.DataFrame) -> pd.DataFrame:
+    """Deduplicate identical physical coordinates WITHIN (source, context_set).
+
+    The same physical tile may legitimately belong to several groups (e.g. a
+    top_k patch that is also an oracle_tumor control): each group is a separate
+    visual-context regime, so cross-source duplicates must be kept. Otherwise
+    the alphabetically earlier sources (oracle_*) shadow top_k rows and all
+    mask-positive top_k patches disappear from the registry.
+
+    context_set is part of the key because standard and diverse top_k largely
+    share coordinates: without it one context regime would shadow the other.
+    """
     before = len(df)
-    df = df.sort_values(["slide_id", "selection_source", "rank"])
-    df = df.drop_duplicates(subset=["slide_id", "x", "y", "tile_size"], keep="first")
+    df = df.sort_values(["slide_id", "selection_source", "context_set", "rank"])
+    df = df.drop_duplicates(
+        subset=["slide_id", "selection_source", "context_set", "x", "y", "tile_size"],
+        keep="first",
+    )
     after = len(df)
-    print(f"  Dedup coordinates: {before} -> {after} rows ({before - after} removed)")
+    print(f"  Dedup coordinates (within source+context_set): "
+          f"{before} -> {after} rows ({before - after} removed)")
     return df
 
 
