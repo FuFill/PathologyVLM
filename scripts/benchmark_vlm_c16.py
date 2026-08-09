@@ -56,6 +56,8 @@ Decide:
 
 First, analyze the patch carefully. Then provide your FINAL ANSWER as a single letter (A, B, or C).
 
+Your response must end with "FINAL ANSWER:" followed by the single letter (A, B, or C).
+
 FINAL ANSWER:"""
 
 PROMPT_TEMPLATE_CONTEXT = """You are a pathology AI analyzing H&E stained lymph node tissue patches.
@@ -72,6 +74,8 @@ First, analyze each patch independently. Then provide your FINAL ANSWER as a sin
 - B if no tumor features are seen in any patch and tissue is adequate
 - C if tissue is inadequate, ambiguous, or you cannot make a determination
 
+Your response must end with "FINAL ANSWER:" followed by the single letter (A, B, or C).
+
 FINAL ANSWER:"""
 
 PROMPT_TEMPLATE_SEPARATE = """You are a pathology AI analyzing an H&E stained lymph node tissue patch.
@@ -84,6 +88,8 @@ Decide:
 - C: The presented data is insufficient to decide
 
 First, analyze the patch carefully. Then provide your FINAL ANSWER as a single letter (A, B, or C).
+
+Your response must end with "FINAL ANSWER:" followed by the single letter (A, B, or C).
 
 FINAL ANSWER:"""
 
@@ -136,10 +142,15 @@ def _parse_answer(raw: str) -> tuple[str, bool]:
     except Exception:
         pass
 
-    # Fallback: take the LAST standalone A/B/C (the decision comes at the end).
-    letters = re.findall(r'\b([ABC])\b', text)
-    if letters:
-        return letters[-1], True
+    # Fallback: decision-letter-first responses (e.g. "B\nRationale: ...").
+    # Take the leading letter; rationale text contains stray standalone
+    # letters (articles "a", "(e.g.,"), so a LAST-letter lookup produced
+    # false parses (e.g. valid "B" answers read as "A").
+    if text.startswith("A") or text.startswith("B") or text.startswith("C"):
+        return text[0], True
+    m = re.search(r'\b([ABC])\b', text)
+    if m:
+        return m.group(1), True
     return text[:50], False
 
 
@@ -275,6 +286,7 @@ def _run_model(
         raise
     print(f"  Model loaded.")
     print(f"  Resolved revision: {getattr(backend, '_revision', None)}")
+    print(f"  Prompt (mode=single): {PROMPT_TEMPLATE_SINGLE[:140].replace(chr(10), ' ')}...")
 
     groups: dict[str, list[dict]] = defaultdict(list)
     for _, row in patches_df.iterrows():
@@ -416,6 +428,7 @@ def _run_model_sets(
     print(f"  Patch sets: {len(patch_sets)}")
 
     prompt = PROMPT_TEMPLATE_SEPARATE if mode == "separate" else PROMPT_TEMPLATE_CONTEXT
+    print(f"  Prompt (mode={mode}): {prompt[:140].replace(chr(10), ' ')}...")
 
     all_records: list[dict] = []
     t0 = time.time()
