@@ -353,6 +353,177 @@ def _run_model(
     return all_records
 
 
+def _build_patch_sets(patches_df: pd.DataFrame, n_patches: int) -> list[list[dict]]:
+    """Group registry rows into per-slide patch sets for separate/context modes.
+
+    Key = (dataset, slide_id, selection_source, context_set, random_seed), so
+    the three random draws stay independent sets, standard/diverse stay
+    separate, and c16_native / c17_to_c16 slides do not mix. Within a group,
+    patches are taken by ascending rank (top-n for top_k, first n otherwise).
+    """
+    df = patches_df.copy()
+    if "random_seed" not in df.columns:
+        df["random_seed"] = 0
+    df["random_seed"] = df["random_seed"].fillna(0)
+    df["rank"] = pd.to_numeric(df.get("rank", 0), errors="coerce").fillna(2 ** 31)
+    keys = ["dataset", "slide_id", "selection_source", "context_set", "random_seed"]
+    sets: list[list[dict]] = []
+    for _, grp in df.groupby(keys, sort=False):
+        grp = grp.sort_values("rank")
+        sets.append([r.to_dict() for _, r in grp.head(n_patches).iterrows()])
+    return sets
+
+
+def _run_model_sets(
+    backend,
+    model_key: str,
+    patches_df: pd.DataFrame,
+    cache_dir: Path,
+    seed: int,
+    temperature: float,
+    load_4bit: bool,
+    mode: str,
+    n_patches: int,
+    max_patches: int = 0,
+) -> list[dict]:
+    print(f"\n{'='*60}")
+    print(f"Running model: {model_key} ({backend.model_id()}) mode={mode}")
+    print(f"{'='*60}")
+
+    print(f"  Loading model weights... (load_4bit={load_4bit})")
+    try:
+        backend.load(load_4bit=load_4bit)
+    except Exception as exc:
+        print(f"  [ERROR] Failed to load {model_key}: {exc}")
+        import traceback
+        traceback.print_exc()
+        raise
+    print("  Model loaded.")
+
+    patch_sets = _build_patch_sets(patches_df, n_patches)
+    if max_patches > 0:
+        patch_sets = patch_sets[:max_patches]
+    print(f"  Patch sets: {len(patch_sets)}")
+
+    prompt = PROMPT_TEMPLATE_SEPARATE if mode == "separate" else PROMPT_TEMPLATE_CONTEXT
+
+    all_records: list[dict] = []
+    t0 = time.time()
+    for si, patches in enumerate(patch_sets):
+        if si % 20 == 0:
+            print(f"  [{si}/{len(patch_sets)}] slide {patches[0].get('slide_id', '?')}")
+
+        pil_images: list[Image.Image] = []
+        patch_info: dict[str, dict] = {}
+        for patch in patches:
+            minio_path = str(patch.get("minio_path", ""))
+            local_path = _download_patch(minio_path, cache_dir) if minio_path else None
+            img = _load_image(local_path) if local_path and local_path.exists() else None
+            if img is None:
+                continue
+            key = f"P{len(pil_images) + 1}"
+            pil_images.append(img)
+            patch_info[key] = {
+                "patch_uid": str(patch.get("patch_uid", "")),
+                "region_uid": str(patch.get("region_uid", "")),
+                "relative_path": str(patch.get("relative_path", "")),
+                "rank": int(patch.get("rank", 0)) if pd.notna(patch.get("rank")) else 0,
+                "tile_in_mask": (
+                    int(patch.get("tumor_mask_overlap", 0))
+                    if pd.notna(patch.get("tumor_mask_overlap"))
+                    else 0
+                ),
+            }
+            if len(pil_images) == n_patches:
+                break
+
+        if not pil_images:
+            continue
+
+        p0 = patches[0]
+        set_id = hashlib.sha256(
+            "|".join([
+                str(p0.get("dataset", "")),
+                str(p0.get("slide_id", "")),
+                str(p0.get("selection_source", "")),
+                str(p0.get("context_set", "")),
+                str(p0.get("random_seed", 0)),
+                mode,
+            ]).encode()
+        ).hexdigest()[:16]
+
+        raw_responses: list[str] = []
+        per_patch_answers: list[str] = []
+        metrics = {}
+
+        try:
+            if mode == "separate":
+                for img in pil_images:
+                    raw = backend.generate(
+                        images=[img],
+                        prompt=prompt,
+                        max_new_tokens=128,
+                        temperature=temperature,
+                        repetition_penalty=1.0,
+                        seed=seed,
+                    )
+                    raw_responses.append(raw)
+                    ans, _ = _parse_answer(raw)
+                    per_patch_answers.append(ans)
+                answer = _resolve_aggregate_answer(per_patch_answers)
+                parse_valid = answer in ("A", "B", "C")
+            else:
+                raw = backend.generate(
+                    images=pil_images,
+                    prompt=prompt,
+                    max_new_tokens=128,
+                    temperature=temperature,
+                    repetition_penalty=1.0,
+                    seed=seed,
+                )
+                raw_responses = [raw]
+                answer, parse_valid = _parse_answer(raw)
+                per_patch_answers = [answer]
+                if hasattr(backend, "diagnostics"):
+                    metrics = backend.diagnostics() or {}
+        except Exception as exc:
+            raw_responses.append(f"ERROR: {exc}")
+            answer = ""
+            parse_valid = False
+
+        seed_val = p0.get("random_seed")
+        src = str(p0.get("selection_source", "unknown"))
+        ctx = str(p0.get("context_set", "")).strip().lower() or "unknown"
+        if src == "random" and pd.notna(seed_val):
+            group_key = f"random_seed_{int(seed_val)}|{ctx}"
+        else:
+            group_key = f"{src}|{ctx}"
+
+        all_records.append({
+            "model": model_key,
+            "mode": mode,
+            "patch_set_uid": set_id,
+            "slide_id": str(p0.get("slide_id", "")),
+            "dataset": str(p0.get("dataset", "")),
+            "context_set": str(p0.get("context_set", "")),
+            "group": group_key,
+            "selection_source": src,
+            "random_seed": int(seed_val) if pd.notna(seed_val) else 0,
+            "tile_in_mask": int(any(p["tile_in_mask"] == 1 for p in patch_info.values())),
+            "n_patches": len(pil_images),
+            "patches": patch_info,
+            "raw_responses": raw_responses,
+            "per_patch_answers": per_patch_answers,
+            "answer": answer,
+            "parse_valid": parse_valid,
+            **({"metrics": metrics} if metrics else {}),
+        })
+
+    elapsed = time.time() - t0
+    print(f"\n  Done: {len(all_records)} sets, {elapsed:.0f}s")
+    return all_records
+
+
 def _resolve_registry(path: str) -> str:
     if path.startswith("s3://"):
         parts = path.replace("s3://", "", 1).split("/", 1)
@@ -446,10 +617,27 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
+        "--mode", default="single",
+        choices=["single", "separate", "context"],
+        help="Patch feeding mode: single = per-patch calls (default); "
+             "separate = n_patches per slide, one call each, aggregated answer "
+             "(any A->A, all B->B, else C); context = n_patches per slide in "
+             "one multi-image call. May be overridden by BENCHMARK_MODE env.",
+    )
+    parser.add_argument(
+        "--n_patches", type=int, default=3,
+        help="Patches per slide for separate/context modes",
+    )
+    parser.add_argument(
         "--max_patches", type=int, default=0,
         help="Debug: run only the first N patches (0 = all)",
     )
     args = parser.parse_args()
+
+    mode = os.environ.get("BENCHMARK_MODE", args.mode)
+    if mode not in ("single", "separate", "context"):
+        print(f"[benchmark] WARNING: unknown BENCHMARK_MODE={mode!r}, falling back to {args.mode}")
+        mode = args.mode
 
     registry_path = _resolve_registry(args.registry_csv)
     print(f"[benchmark] Loading registry: {registry_path}")
@@ -537,21 +725,41 @@ def main() -> int:
         return 2
 
     all_results = {}
+    models_meta: dict[str, dict] = {}
     for model_key, module_path, class_name in model_configs:
         try:
             mod = importlib.import_module(module_path)
             backend_cls = getattr(mod, class_name)
             backend = backend_cls()
-            results = _run_model(
-                backend=backend,
-                model_key=model_key,
-                patches_df=patches_df,
-                cache_dir=cache_dir,
-                seed=args.seed,
-                temperature=args.temperature,
-                load_4bit=load_4bit,
-                max_patches=args.max_patches,
-            )
+            if mode == "single":
+                results = _run_model(
+                    backend=backend,
+                    model_key=model_key,
+                    patches_df=patches_df,
+                    cache_dir=cache_dir,
+                    seed=args.seed,
+                    temperature=args.temperature,
+                    load_4bit=load_4bit,
+                    max_patches=args.max_patches,
+                )
+            else:
+                results = _run_model_sets(
+                    backend=backend,
+                    model_key=model_key,
+                    patches_df=patches_df,
+                    cache_dir=cache_dir,
+                    seed=args.seed,
+                    temperature=args.temperature,
+                    load_4bit=load_4bit,
+                    mode=mode,
+                    n_patches=args.n_patches,
+                    max_patches=args.max_patches,
+                )
+            models_meta[model_key] = {
+                "model_id": backend.model_id(),
+                "revision": getattr(backend, "_revision", None),
+                "quantization": "bf16" if not load_4bit else "nf4",
+            }
             all_results[model_key] = results
         except Exception as exc:
             print(f"[benchmark] SKIPPING {model_key}: {exc}")
@@ -602,8 +810,8 @@ def main() -> int:
 
         # --- Model selection decision ---
         print(f"\n    === MODEL SELECTION: {model_key} ===")
-        oracle_tumor_recs = [r for r in records if r.get("group") == "oracle_tumor"]
-        oracle_non_tumor_recs = [r for r in records if r.get("group") == "oracle_non_tumor"]
+        oracle_tumor_recs = [r for r in records if r.get("group", "").startswith("oracle_tumor")]
+        oracle_non_tumor_recs = [r for r in records if r.get("group", "").startswith("oracle_non_tumor")]
 
         if oracle_tumor_recs:
             ot_m = _per_group_metrics(oracle_tumor_recs)
@@ -653,6 +861,10 @@ def main() -> int:
         "config": {
             "seed": args.seed,
             "temperature": args.temperature,
+            "mode": mode,
+            "n_patches": args.n_patches,
+            "git_commit": _git_commit(),
+            "models": models_meta,
         },
         "models": {
             k: v for k, v in all_results.items()
