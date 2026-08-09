@@ -54,9 +54,9 @@ Decide:
 - B: Tumor features are NOT visible in this patch
 - C: The presented data is insufficient to decide
 
-First, analyze the patch carefully. Then provide your FINAL ANSWER as a single letter (A, B, or C).
+First, analyze the patch carefully and briefly explain your reasoning.
 
-Your response must end with "FINAL ANSWER:" followed by the single letter (A, B, or C).
+Then, after your reasoning, append the phrase "FINAL ANSWER:" followed by your choice (A, B, or C) at the end of your response.
 
 FINAL ANSWER:"""
 
@@ -69,12 +69,12 @@ For each patch, decide:
 - B: Tumor features are NOT visible in this patch
 - C: The presented data is insufficient to decide
 
-First, analyze each patch independently. Then provide your FINAL ANSWER as a single letter (A, B, or C) based on the overall assessment:
+First, analyze each patch independently and briefly explain your reasoning. Then give your overall assessment:
 - A if tumor is evident in at least one patch
 - B if no tumor features are seen in any patch and tissue is adequate
 - C if tissue is inadequate, ambiguous, or you cannot make a determination
 
-Your response must end with "FINAL ANSWER:" followed by the single letter (A, B, or C).
+Then, after your reasoning, append the phrase "FINAL ANSWER:" followed by your choice (A, B, or C) at the end of your response.
 
 FINAL ANSWER:"""
 
@@ -87,9 +87,9 @@ Decide:
 - B: Tumor features are NOT visible in this patch
 - C: The presented data is insufficient to decide
 
-First, analyze the patch carefully. Then provide your FINAL ANSWER as a single letter (A, B, or C).
+First, analyze the patch carefully and briefly explain your reasoning.
 
-Your response must end with "FINAL ANSWER:" followed by the single letter (A, B, or C).
+Then, after your reasoning, append the phrase "FINAL ANSWER:" followed by your choice (A, B, or C) at the end of your response.
 
 FINAL ANSWER:"""
 
@@ -303,7 +303,11 @@ def _run_model(
     t0 = time.time()
     total = sum(len(v) for v in groups.values())
 
-    for group_key in sorted(groups):
+    group_keys = sorted(groups)
+    group_keys = [k for k in group_keys if k.startswith("top_k")] + [
+        k for k in group_keys if not k.startswith("top_k")
+    ]
+    for group_key in group_keys:
         group_patches = groups[group_key]
         print(f"\n  --- {group_key} ({len(group_patches)} patches) ---")
 
