@@ -56,8 +56,6 @@ Decide:
 
 First, analyze the patch carefully. Then provide your FINAL ANSWER as a single letter (A, B, or C).
 
-Reply with exactly one letter: A, B, or C. Do not add any other text, explanations, or JSON.
-
 FINAL ANSWER:"""
 
 PROMPT_TEMPLATE_CONTEXT = """You are a pathology AI analyzing H&E stained lymph node tissue patches.
@@ -261,20 +259,22 @@ def _run_model(
     temperature: float,
     load_4bit: bool,
     max_patches: int = 0,
+    revision: Optional[str] = None,
 ) -> list[dict]:
     print(f"\n{'='*60}")
     print(f"Running model: {model_key} ({backend.model_id()})")
     print(f"{'='*60}")
 
-    print(f"  Loading model weights... (load_4bit={load_4bit})")
+    print(f"  Loading model weights... (load_4bit={load_4bit}, revision={revision})")
     try:
-        backend.load(load_4bit=load_4bit)
+        backend.load(load_4bit=load_4bit, revision=revision)
     except Exception as exc:
         print(f"  [ERROR] Failed to load {model_key}: {exc}")
         import traceback
         traceback.print_exc()
         raise
     print(f"  Model loaded.")
+    print(f"  Resolved revision: {getattr(backend, '_revision', None)}")
 
     groups: dict[str, list[dict]] = defaultdict(list)
     for _, row in patches_df.iterrows():
@@ -304,6 +304,9 @@ def _run_model(
                 print(f"    [{pi+1}/{len(group_patches)}] SKIP (no image)")
                 continue
 
+            if pi == 0:
+                print(f"    image size: {img.size}")
+
             try:
                 raw = backend.generate(
                     images=[img],
@@ -319,7 +322,7 @@ def _run_model(
             ans, valid = _parse_answer(raw)
 
             trunc = raw[:1000].replace("\n", "\\n")
-            print(f"    RAW[{pi+1}]: {trunc}")
+            print(f"    [{pi+1}/{len(group_patches)}] RAW: {trunc}  -> {ans}")
 
             metrics = {}
             if hasattr(backend, "diagnostics"):
@@ -338,15 +341,20 @@ def _run_model(
                     if pd.notna(patch.get("tumor_mask_overlap"))
                     else 0
                 ),
+                "prompt": PROMPT_TEMPLATE_SINGLE,
                 "raw_response": raw,
                 "answer": ans,
                 "parse_valid": valid,
                 **({"metrics": metrics} if metrics else {}),
             })
-            print(f"    [{pi+1}/{len(group_patches)}] answer: {ans}", end="\r")
 
-        group_as = [r["answer"] for r in all_records if r["group"] == group_key]
-        print(f"    A={group_as.count('A')} B={group_as.count('B')} C={group_as.count('C')}")
+        group_records = [r for r in all_records if r["group"] == group_key]
+        group_as = [r["answer"] for r in group_records]
+        group_raws = [r["raw_response"] for r in group_records if r["raw_response"]]
+        avg_raw_len = sum(len(r) for r in group_raws) / len(group_raws) if group_raws else 0
+        unique_raw = len(set(group_raws))
+        print(f"    A={group_as.count('A')} B={group_as.count('B')} C={group_as.count('C')} "
+              f"unique_raw={unique_raw} avg_raw_len={avg_raw_len:.0f}")
 
     elapsed = time.time() - t0
     print(f"\n  Done: {total} patches, {elapsed:.0f}s")
@@ -385,20 +393,22 @@ def _run_model_sets(
     mode: str,
     n_patches: int,
     max_patches: int = 0,
+    revision: Optional[str] = None,
 ) -> list[dict]:
     print(f"\n{'='*60}")
     print(f"Running model: {model_key} ({backend.model_id()}) mode={mode}")
     print(f"{'='*60}")
 
-    print(f"  Loading model weights... (load_4bit={load_4bit})")
+    print(f"  Loading model weights... (load_4bit={load_4bit}, revision={revision})")
     try:
-        backend.load(load_4bit=load_4bit)
+        backend.load(load_4bit=load_4bit, revision=revision)
     except Exception as exc:
         print(f"  [ERROR] Failed to load {model_key}: {exc}")
         import traceback
         traceback.print_exc()
         raise
     print("  Model loaded.")
+    print(f"  Resolved revision: {getattr(backend, '_revision', None)}")
 
     patch_sets = _build_patch_sets(patches_df, n_patches)
     if max_patches > 0:
@@ -491,6 +501,10 @@ def _run_model_sets(
             answer = ""
             parse_valid = False
 
+        if si < 3 or not parse_valid:
+            for ri, r in enumerate(raw_responses):
+                print(f"    RAW[{ri}]: {r[:1000].replace(chr(10), chr(92) + 'n')}")
+
         seed_val = p0.get("random_seed")
         src = str(p0.get("selection_source", "unknown"))
         ctx = str(p0.get("context_set", "")).strip().lower() or "unknown"
@@ -512,6 +526,7 @@ def _run_model_sets(
             "tile_in_mask": int(any(p["tile_in_mask"] == 1 for p in patch_info.values())),
             "n_patches": len(pil_images),
             "patches": patch_info,
+            "prompt": prompt,
             "raw_responses": raw_responses,
             "per_patch_answers": per_patch_answers,
             "answer": answer,
@@ -695,6 +710,12 @@ def main() -> int:
         print(f"[benchmark] WARNING: unknown BENCHMARK_DTYPE={dtype!r}, using bf16")
         load_4bit = False
 
+    revision = os.environ.get("BENCHMARK_REVISION", "").strip() or None
+    if revision:
+        print(f"[benchmark] Pinned model revision: {revision}")
+    else:
+        print("[benchmark] Model revision: latest (not pinned)")
+
     cuda_models = [
         c for c in model_configs
         if getattr(getattr(importlib.import_module(c[1]), c[2]), "requires_cuda", False)
@@ -741,6 +762,7 @@ def main() -> int:
                     temperature=args.temperature,
                     load_4bit=load_4bit,
                     max_patches=args.max_patches,
+                    revision=revision,
                 )
             else:
                 results = _run_model_sets(
@@ -754,6 +776,7 @@ def main() -> int:
                     mode=mode,
                     n_patches=args.n_patches,
                     max_patches=args.max_patches,
+                    revision=revision,
                 )
             models_meta[model_key] = {
                 "model_id": backend.model_id(),
@@ -864,6 +887,12 @@ def main() -> int:
             "mode": mode,
             "n_patches": args.n_patches,
             "git_commit": _git_commit(),
+            "revision": revision,
+            "prompts": {
+                "single": PROMPT_TEMPLATE_SINGLE,
+                "separate": PROMPT_TEMPLATE_SEPARATE,
+                "context": PROMPT_TEMPLATE_CONTEXT,
+            },
             "models": models_meta,
         },
         "models": {
