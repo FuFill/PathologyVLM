@@ -209,7 +209,7 @@ REGISTRY_CSV_DEFAULT = (
 
 C16_DATASETS = ("c16_native", "c17_to_c16")
 SOURCES_SINGLE = ("top_k", "oracle_tumor", "oracle_non_tumor", "hard_negative")
-RANDOM_SEEDS = (0, 1, 2)
+RANDOM_SEEDS = (42, 123, 456)
 
 
 def _per_group_metrics(records: list[dict]) -> dict:
@@ -279,11 +279,12 @@ def _run_model(
     groups: dict[str, list[dict]] = defaultdict(list)
     for _, row in patches_df.iterrows():
         src = str(row.get("selection_source", "unknown"))
+        ctx = str(row.get("context_set", "")).strip().lower() or "unknown"
         seed_val = row.get("random_seed")
         if src == "random" and pd.notna(seed_val):
-            group_key = f"random_seed_{int(seed_val)}"
+            group_key = f"random_seed_{int(seed_val)}|{ctx}"
         else:
-            group_key = src
+            group_key = f"{src}|{ctx}"
         groups[group_key].append(row.to_dict())
 
     all_records: list[dict] = []
@@ -329,6 +330,7 @@ def _run_model(
                 "patch_uid": str(patch.get("patch_uid", "")),
                 "slide_id": str(patch.get("slide_id", "")),
                 "dataset": str(patch.get("dataset", "")),
+                "context_set": str(patch.get("context_set", "")),
                 "group": group_key,
                 "selection_source": str(patch.get("selection_source", "")),
                 "tile_in_mask": (
@@ -457,9 +459,8 @@ def main() -> int:
     registry = registry[registry["dataset"].isin(C16_DATASETS)]
     print(f"  After C16 dataset filter: {len(registry)}")
 
-    non_diverse = registry[registry.get("is_diverse", 0) == 0].copy()
-    non_random = non_diverse[non_diverse["selection_source"] != "random"]
-    random_part = non_diverse[non_diverse["selection_source"] == "random"].copy()
+    non_random = registry[registry["selection_source"] != "random"].copy()
+    random_part = registry[registry["selection_source"] == "random"].copy()
 
     if "random_seed" in random_part.columns:
         for seed_val in RANDOM_SEEDS:
