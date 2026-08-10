@@ -427,6 +427,9 @@ def _run_model_sets(
     print(f"  Resolved revision: {getattr(backend, '_revision', None)}")
 
     patch_sets = _build_patch_sets(patches_df, n_patches)
+    patch_sets = [s for s in patch_sets if s[0].get("selection_source") == "top_k"] + [
+        s for s in patch_sets if s[0].get("selection_source") != "top_k"
+    ]
     if max_patches > 0:
         patch_sets = patch_sets[:max_patches]
     print(f"  Patch sets: {len(patch_sets)}")
@@ -712,7 +715,7 @@ def main() -> int:
     family_models = {"med_gemma", "gemma3_27b"} if args.model == "gemma_family" else set()
     model_configs = [
         c for c in all_configs
-        if args.model in ("all", c[0]) or c[0] in family_models or c[0] == "med_siglip"
+        if args.model in ("all", c[0]) or c[0] in family_models
     ]
     print(f"[benchmark] Models to run: {[c[0] for c in model_configs]}")
 
