@@ -518,7 +518,7 @@ def _run_model_sets(
 
         try:
             if mode == "separate":
-                for img in pil_images:
+                for idx, img in enumerate(pil_images):
                     raw = backend.generate(
                         images=[img],
                         prompt=prompt,
@@ -530,8 +530,13 @@ def _run_model_sets(
                     raw_responses.append(raw)
                     ans, _ = _parse_answer(raw)
                     per_patch_answers.append(ans)
+                    print(
+                        f"    [{si+1}/{len(patch_sets)} P{idx+1}/{len(pil_images)}] "
+                        f"RAW: {raw.replace(chr(10), chr(92) + 'n')}  -> {ans}"
+                    )
                 answer = _resolve_aggregate_answer(per_patch_answers)
                 parse_valid = answer in ("A", "B", "C")
+                print(f"    [{si+1}/{len(patch_sets)}] aggregate -> {answer}")
             else:
                 raw = backend.generate(
                     images=pil_images,
@@ -544,16 +549,17 @@ def _run_model_sets(
                 raw_responses = [raw]
                 answer, parse_valid = _parse_answer(raw)
                 per_patch_answers = [answer]
+                print(
+                    f"    [{si+1}/{len(patch_sets)}] RAW: "
+                    f"{raw.replace(chr(10), chr(92) + 'n')}  -> {answer}"
+                )
                 if hasattr(backend, "diagnostics"):
                     metrics = backend.diagnostics() or {}
         except Exception as exc:
             raw_responses.append(f"ERROR: {exc}")
             answer = ""
             parse_valid = False
-
-        if si < 3 or not parse_valid:
-            for ri, r in enumerate(raw_responses):
-                print(f"    RAW[{ri}]: {r.replace(chr(10), chr(92) + 'n')}")
+            print(f"    [{si+1}/{len(patch_sets)}] RAW: ERROR: {exc}")
 
         seed_val = p0.get("random_seed")
         src = str(p0.get("selection_source", "unknown"))
