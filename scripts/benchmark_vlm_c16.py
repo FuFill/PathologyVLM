@@ -294,14 +294,17 @@ def _run_model(
     print(f"Running model: {model_key} ({backend.model_id()})")
     print(f"{'='*60}")
 
-    print(f"  Loading model weights... (load_4bit={load_4bit}, revision={revision})")
-    try:
-        backend.load(load_4bit=load_4bit, revision=revision)
-    except Exception as exc:
-        print(f"  [ERROR] Failed to load {model_key}: {exc}")
-        import traceback
-        traceback.print_exc()
-        raise
+    if getattr(backend, "_model", None) is None:
+        print(f"  Loading model weights... (load_4bit={load_4bit}, revision={revision})")
+        try:
+            backend.load(load_4bit=load_4bit, revision=revision)
+        except Exception as exc:
+            print(f"  [ERROR] Failed to load {model_key}: {exc}")
+            import traceback
+            traceback.print_exc()
+            raise
+    else:
+        print("  Model already loaded, reusing.")
     print(f"  Model loaded.")
     print(f"  Resolved revision: {getattr(backend, '_revision', None)}")
     print(f"  Prompt (mode=single): {PROMPT_TEMPLATE_SINGLE[:140].replace(chr(10), ' ')}...")
@@ -369,6 +372,7 @@ def _run_model(
 
             all_records.append({
                 "model": model_key,
+                "mode": "single",
                 "patch_uid": str(patch.get("patch_uid", "")),
                 "slide_id": str(patch.get("slide_id", "")),
                 "dataset": str(patch.get("dataset", "")),
@@ -438,14 +442,17 @@ def _run_model_sets(
     print(f"Running model: {model_key} ({backend.model_id()}) mode={mode}")
     print(f"{'='*60}")
 
-    print(f"  Loading model weights... (load_4bit={load_4bit}, revision={revision})")
-    try:
-        backend.load(load_4bit=load_4bit, revision=revision)
-    except Exception as exc:
-        print(f"  [ERROR] Failed to load {model_key}: {exc}")
-        import traceback
-        traceback.print_exc()
-        raise
+    if getattr(backend, "_model", None) is None:
+        print(f"  Loading model weights... (load_4bit={load_4bit}, revision={revision})")
+        try:
+            backend.load(load_4bit=load_4bit, revision=revision)
+        except Exception as exc:
+            print(f"  [ERROR] Failed to load {model_key}: {exc}")
+            import traceback
+            traceback.print_exc()
+            raise
+    else:
+        print("  Model already loaded, reusing.")
     print("  Model loaded.")
     print(f"  Resolved revision: {getattr(backend, '_revision', None)}")
 
@@ -693,9 +700,13 @@ def main() -> int:
     args = parser.parse_args()
 
     mode = os.environ.get("BENCHMARK_MODE", args.mode)
-    if mode not in ("single", "separate", "context"):
+    if mode == "both":
+        run_modes = ["separate", "context"]
+    elif mode in ("single", "separate", "context"):
+        run_modes = [mode]
+    else:
         print(f"[benchmark] WARNING: unknown BENCHMARK_MODE={mode!r}, falling back to {args.mode}")
-        mode = args.mode
+        run_modes = [args.mode]
 
     registry_path = _resolve_registry(args.registry_csv)
     print(f"[benchmark] Loading registry: {registry_path}")
@@ -808,19 +819,23 @@ def main() -> int:
                     revision=revision,
                 )
             else:
-                results = _run_model_sets(
-                    backend=backend,
-                    model_key=model_key,
-                    patches_df=patches_df,
-                    cache_dir=cache_dir,
-                    seed=args.seed,
-                    temperature=args.temperature,
-                    load_4bit=load_4bit,
-                    mode=mode,
-                    n_patches=args.n_patches,
-                    max_patches=args.max_patches,
-                    revision=revision,
-                )
+                mode_results = []
+                for _mode in run_modes:
+                    print(f"\n===== MODE: {_mode} =====")
+                    mode_results.append(_run_model_sets(
+                        backend=backend,
+                        model_key=model_key,
+                        patches_df=patches_df,
+                        cache_dir=cache_dir,
+                        seed=args.seed,
+                        temperature=args.temperature,
+                        load_4bit=load_4bit,
+                        mode=_mode,
+                        n_patches=args.n_patches,
+                        max_patches=args.max_patches,
+                        revision=revision,
+                    ))
+                results = [r for res in mode_results for r in res]
             models_meta[model_key] = {
                 "model_id": backend.model_id(),
                 "revision": getattr(backend, "_revision", None),
@@ -839,79 +854,82 @@ def main() -> int:
 
     rows = []
     for model_key, records in all_results.items():
-        print(f"\n  === {model_key} ===")
+        modes_in_data = sorted({r.get("mode", "unknown") for r in records})
+        for rec_mode in modes_in_data:
+            recs = [r for r in records if r.get("mode") == rec_mode]
+            print(f"\n  === {model_key} [mode={rec_mode}] ===")
 
-        groups_in_data = sorted(set(r["group"] for r in records))
-        for gk in groups_in_data:
-            grp = [r for r in records if r["group"] == gk]
-            m = _per_group_metrics(grp)
-            rows.append({"model": model_key, "group": gk, **m})
-            print(f"\n    --- {gk} (n={m['n']}) ---")
-            for k in ("n_parsable", "sensitivity", "specificity", "balanced_accuracy",
-                      "n_mask_pos", "n_mask_neg", "TP", "FN", "TN", "FP",
-                      "unique_raw", "mode_collapse"):
-                v = m[k]
-                if isinstance(v, float):
-                    print(f"      {k}: {v:.4f}")
+            groups_in_data = sorted(set(r["group"] for r in recs))
+            for gk in groups_in_data:
+                grp = [r for r in recs if r["group"] == gk]
+                m = _per_group_metrics(grp)
+                rows.append({"model": model_key, "mode": rec_mode, "group": gk, **m})
+                print(f"\n    --- {gk} (n={m['n']}) ---")
+                for k in ("n_parsable", "sensitivity", "specificity", "balanced_accuracy",
+                          "n_mask_pos", "n_mask_neg", "TP", "FN", "TN", "FP",
+                          "unique_raw", "mode_collapse"):
+                    v = m[k]
+                    if isinstance(v, float):
+                        print(f"      {k}: {v:.4f}")
+                    else:
+                        print(f"      {k}: {v}")
+                print()
+
+            total_n = len(recs)
+            pos_recs = [r for r in recs if r.get("tile_in_mask") == 1]
+            neg_recs = [r for r in recs if r.get("tile_in_mask") == 0]
+            tp = sum(1 for r in pos_recs if r.get("answer") == "A")
+            fn = sum(1 for r in pos_recs if r.get("answer") in ("B", "C"))
+            tn = sum(1 for r in neg_recs if r.get("answer") == "B")
+            fp = sum(1 for r in neg_recs if r.get("answer") == "A")
+            sens_total = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+            spec_total = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
+            bacc_total = (sens_total + spec_total) / 2
+            print(f"    --- ALL GROUPS (n={total_n}) ---")
+            print(f"      mask-pos: {len(pos_recs)}, mask-neg: {len(neg_recs)}")
+            print(f"      TP={tp} FN={fn} TN={tn} FP={fp}")
+            print(f"      sensitivity: {sens_total:.4f}")
+            print(f"      specificity: {spec_total:.4f}")
+            print(f"      balanced_accuracy: {bacc_total:.4f}")
+
+            # --- Model selection decision ---
+            print(f"\n    === MODEL SELECTION: {model_key} [mode={rec_mode}] ===")
+            oracle_tumor_recs = [r for r in recs if r.get("group", "").startswith("oracle_tumor")]
+            oracle_non_tumor_recs = [r for r in recs if r.get("group", "").startswith("oracle_non_tumor")]
+
+            if oracle_tumor_recs:
+                ot_m = _per_group_metrics(oracle_tumor_recs)
+                print(f"      oracle_tumor: sens={ot_m['sensitivity']:.4f}  "
+                      f"parsable={ot_m['n_parsable']}/{ot_m['n']}  "
+                      f"unique_raw={ot_m['unique_raw']}")
+            if oracle_non_tumor_recs:
+                ont_m = _per_group_metrics(oracle_non_tumor_recs)
+                print(f"      oracle_non_tumor: spec={ont_m['specificity']:.4f}  "
+                      f"parsable={ont_m['n_parsable']}/{ont_m['n']}  "
+                      f"unique_raw={ont_m['unique_raw']}")
+
+            if oracle_tumor_recs and oracle_non_tumor_recs:
+                ot_sens = ot_m.get("sensitivity", 0)
+                ont_spec = ont_m.get("specificity", 0)
+                ot_ba = ot_m.get("balanced_accuracy", 0)
+                ont_ba = ont_m.get("balanced_accuracy", 0)
+                mean_ba = (ot_ba + ont_ba) / 2
+                parse_rate = (ot_m.get("n_parsable", 0) + ont_m.get("n_parsable", 0)) / max(ot_m.get("n", 1) + ont_m.get("n", 1), 1)
+                mode_collapse_ot = ot_m.get("mode_collapse", 1) > 0.8
+                mode_collapse_ont = ont_m.get("mode_collapse", 1) > 0.8
+
+                print(f"      Combined: mean_balanced_acc={mean_ba:.4f}  parse_rate={parse_rate:.4f}")
+                discriminates = ot_sens > 0.4 and ont_spec > 0.4 and mean_ba > 0.45
+                if mode_collapse_ot or mode_collapse_ont:
+                    print(f"      WARNING: mode collapse detected (unique_raw close to 1)")
+                if parse_rate < 0.8:
+                    print(f"      WARNING: low parse rate ({parse_rate:.4f})")
+
+                if discriminates:
+                    print(f"      >>> PASS: model distinguishes mask-positive from mask-negative")
                 else:
-                    print(f"      {k}: {v}")
-            print()
-
-        total_n = len(records)
-        pos_recs = [r for r in records if r.get("tile_in_mask") == 1]
-        neg_recs = [r for r in records if r.get("tile_in_mask") == 0]
-        tp = sum(1 for r in pos_recs if r.get("answer") == "A")
-        fn = sum(1 for r in pos_recs if r.get("answer") in ("B", "C"))
-        tn = sum(1 for r in neg_recs if r.get("answer") == "B")
-        fp = sum(1 for r in neg_recs if r.get("answer") == "A")
-        sens_total = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
-        spec_total = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
-        bacc_total = (sens_total + spec_total) / 2
-        print(f"    --- ALL GROUPS (n={total_n}) ---")
-        print(f"      mask-pos: {len(pos_recs)}, mask-neg: {len(neg_recs)}")
-        print(f"      TP={tp} FN={fn} TN={tn} FP={fp}")
-        print(f"      sensitivity: {sens_total:.4f}")
-        print(f"      specificity: {spec_total:.4f}")
-        print(f"      balanced_accuracy: {bacc_total:.4f}")
-
-        # --- Model selection decision ---
-        print(f"\n    === MODEL SELECTION: {model_key} ===")
-        oracle_tumor_recs = [r for r in records if r.get("group", "").startswith("oracle_tumor")]
-        oracle_non_tumor_recs = [r for r in records if r.get("group", "").startswith("oracle_non_tumor")]
-
-        if oracle_tumor_recs:
-            ot_m = _per_group_metrics(oracle_tumor_recs)
-            print(f"      oracle_tumor: sens={ot_m['sensitivity']:.4f}  "
-                  f"parsable={ot_m['n_parsable']}/{ot_m['n']}  "
-                  f"unique_raw={ot_m['unique_raw']}")
-        if oracle_non_tumor_recs:
-            ont_m = _per_group_metrics(oracle_non_tumor_recs)
-            print(f"      oracle_non_tumor: spec={ont_m['specificity']:.4f}  "
-                  f"parsable={ont_m['n_parsable']}/{ont_m['n']}  "
-                  f"unique_raw={ont_m['unique_raw']}")
-
-        if oracle_tumor_recs and oracle_non_tumor_recs:
-            ot_sens = ot_m.get("sensitivity", 0)
-            ont_spec = ont_m.get("specificity", 0)
-            ot_ba = ot_m.get("balanced_accuracy", 0)
-            ont_ba = ont_m.get("balanced_accuracy", 0)
-            mean_ba = (ot_ba + ont_ba) / 2
-            parse_rate = (ot_m.get("n_parsable", 0) + ont_m.get("n_parsable", 0)) / max(ot_m.get("n", 1) + ont_m.get("n", 1), 1)
-            mode_collapse_ot = ot_m.get("mode_collapse", 1) > 0.8
-            mode_collapse_ont = ont_m.get("mode_collapse", 1) > 0.8
-
-            print(f"      Combined: mean_balanced_acc={mean_ba:.4f}  parse_rate={parse_rate:.4f}")
-            discriminates = ot_sens > 0.4 and ont_spec > 0.4 and mean_ba > 0.45
-            if mode_collapse_ot or mode_collapse_ont:
-                print(f"      WARNING: mode collapse detected (unique_raw close to 1)")
-            if parse_rate < 0.8:
-                print(f"      WARNING: low parse rate ({parse_rate:.4f})")
-
-            if discriminates:
-                print(f"      >>> PASS: model distinguishes mask-positive from mask-negative")
-            else:
-                print(f"      >>> FAIL: model does NOT reliably distinguish groups")
-                print(f"      >>> C17 full run will NOT be meaningful for {model_key}")
+                    print(f"      >>> FAIL: model does NOT reliably distinguish groups")
+                    print(f"      >>> C17 full run will NOT be meaningful for {model_key}")
 
     summary_df = pd.DataFrame(rows)
     tid = os.environ.get("CLEARML_TASK_ID", "")
@@ -931,6 +949,7 @@ def main() -> int:
             "n_patches": args.n_patches,
             "git_commit": _git_commit(),
             "revision": revision,
+            "modes": run_modes,
             "prompts": {
                 "single": PROMPT_TEMPLATE_SINGLE,
                 "separate": PROMPT_TEMPLATE_SEPARATE,
