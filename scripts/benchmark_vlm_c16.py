@@ -31,7 +31,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Optional
 
@@ -223,10 +223,14 @@ def _load_image(path: Path) -> Optional[Image.Image]:
 
 
 def _resolve_aggregate_answer(separate_results: list[str]) -> str:
-    if any(r == "A" for r in separate_results):
-        return "A"
-    if all(r == "B" for r in separate_results):
-        return "B"
+    votes = [r for r in separate_results if r in ("A", "B", "C")]
+    counts = Counter(votes)
+    if not counts:
+        return "C"
+    top = max(counts.values())
+    winners = [k for k, v in counts.items() if v == top]
+    if len(winners) == 1:
+        return winners[0]
     return "C"
 
 REGISTRY_CSV_DEFAULT = (

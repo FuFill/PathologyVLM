@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
 
@@ -174,11 +175,15 @@ def _build_patch_set_id(patches: list[dict]) -> str:
 
 
 def _resolve_aggregate_answer(separate_results: list[str]) -> str:
-    """Aggregate separate-patch answers: if any A -> A, elif all B -> B, else C."""
-    if any(r == "A" for r in separate_results):
-        return "A"
-    if all(r == "B" for r in separate_results):
-        return "B"
+    """Aggregate separate-patch answers: majority vote; on a tie -> C."""
+    votes = [r for r in separate_results if r in ("A", "B", "C")]
+    counts = Counter(votes)
+    if not counts:
+        return "C"
+    top = max(counts.values())
+    winners = [k for k, v in counts.items() if v == top]
+    if len(winners) == 1:
+        return winners[0]
     return "C"
 
 
