@@ -337,7 +337,7 @@ def _run_model(
 
             ans, valid = _parse_answer(raw)
 
-            trunc = raw[:1000].replace("\n", "\\n")
+            trunc = raw.replace("\n", "\\n")
             print(f"    [{pi+1}/{len(group_patches)}] RAW: {trunc}  -> {ans}")
 
             metrics = {}
