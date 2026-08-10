@@ -523,7 +523,7 @@ def _run_model_sets(
 
         if si < 3 or not parse_valid:
             for ri, r in enumerate(raw_responses):
-                print(f"    RAW[{ri}]: {r[:1000].replace(chr(10), chr(92) + 'n')}")
+                print(f"    RAW[{ri}]: {r.replace(chr(10), chr(92) + 'n')}")
 
         seed_val = p0.get("random_seed")
         src = str(p0.get("selection_source", "unknown"))
