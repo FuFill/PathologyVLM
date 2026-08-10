@@ -363,7 +363,7 @@ class QuiltLLaVABackend(VLMBackend):
             new_tokens = output_ids
 
         decoded = self._tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0]
-        decoded = "{" + decoded.strip()
+        decoded = decoded.strip()
 
         if stop_str and decoded.endswith(stop_str):
             decoded = decoded[: -len(stop_str)]

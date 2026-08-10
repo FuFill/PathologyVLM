@@ -60,6 +60,19 @@ Then, after your reasoning, append the phrase "FINAL ANSWER:" followed by your c
 
 FINAL ANSWER:"""
 
+PROMPT_TEMPLATE_SINGLE_QUILT = """You are a pathology AI analyzing an H&E stained lymph node tissue patch.
+
+Below is a tissue patch (P1) from a lymph node biopsy.
+
+Which of the following best describes this patch?
+A: Tumor features are clearly visible in this patch
+B: Tumor features are NOT visible in this patch
+C: The presented data is insufficient to decide
+
+Begin your answer with exactly one letter (A, B, or C), then briefly explain your reasoning.
+
+Answer:"""
+
 PROMPT_TEMPLATE_CONTEXT = """You are a pathology AI analyzing H&E stained lymph node tissue patches.
 
 Below are three tissue patches (P1, P2, P3) from a lymph node biopsy.
@@ -143,14 +156,19 @@ def _parse_answer(raw: str) -> tuple[str, bool]:
         pass
 
     # Fallback: decision-letter-first responses (e.g. "B\nRationale: ...").
-    # Take the leading letter; rationale text contains stray standalone
-    # letters (articles "a", "(e.g.,"), so a LAST-letter lookup produced
-    # false parses (e.g. valid "B" answers read as "A").
-    if text.startswith("A") or text.startswith("B") or text.startswith("C"):
-        return text[0], True
-    m = re.search(r'\b([ABC])\b', text)
+    # Case-sensitive on the raw text: the model copies the option letters
+    # ("A"/"B"/"C") from the prompt in uppercase, while prose articles are
+    # lowercase ("a few ..."). The leading letter must be followed by a
+    # separator or end-of-string; otherwise take the LAST standalone
+    # uppercase letter in the trailing window (the answer letter, if
+    # written, is at the end).
+    raw_stripped = raw.strip()
+    m = re.match(r'^([ABC])(?=[\n:.,;)]|$)', raw_stripped)
     if m:
         return m.group(1), True
+    matches = re.findall(r'\b([ABC])\b', raw_stripped[-80:])
+    if matches:
+        return matches[-1], True
     return text[:50], False
 
 
@@ -323,10 +341,15 @@ def _run_model(
             if pi == 0:
                 print(f"    image size: {img.size}")
 
+            prompt = (
+                PROMPT_TEMPLATE_SINGLE_QUILT
+                if model_key == "quilt_llava"
+                else PROMPT_TEMPLATE_SINGLE
+            )
             try:
                 raw = backend.generate(
                     images=[img],
-                    prompt=PROMPT_TEMPLATE_SINGLE,
+                    prompt=prompt,
                     max_new_tokens=128,
                     temperature=temperature,
                     repetition_penalty=1.0,
@@ -357,7 +380,7 @@ def _run_model(
                     if pd.notna(patch.get("tumor_mask_overlap"))
                     else 0
                 ),
-                "prompt": PROMPT_TEMPLATE_SINGLE,
+                "prompt": prompt,
                 "raw_response": raw,
                 "answer": ans,
                 "parse_valid": valid,
