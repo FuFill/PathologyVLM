@@ -545,7 +545,7 @@ def _run_model_sets(
                 raw = backend.generate(
                     images=pil_images,
                     prompt=prompt,
-                    max_new_tokens=128,
+                    max_new_tokens=512,
                     temperature=temperature,
                     repetition_penalty=1.0,
                     seed=seed,
