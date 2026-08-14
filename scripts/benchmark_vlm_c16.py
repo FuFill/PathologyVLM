@@ -239,6 +239,8 @@ REGISTRY_CSV_DEFAULT = (
 )
 
 C16_DATASETS = ("c16_native", "c17_to_c16")
+C17_DATASETS = ("c17_native", "c16_to_c17")
+DATASET_SETS = {"c16": C16_DATASETS, "c17": C17_DATASETS}
 SOURCES_SINGLE = ("top_k", "oracle_tumor", "oracle_non_tumor", "hard_negative")
 RANDOM_SEEDS = (42, 123, 456)
 
@@ -687,8 +689,15 @@ def main() -> int:
         choices=["all", "quilt_llava", "med_gemma", "med_siglip", "gemma3_27b", "gemma_family"],
     )
     parser.add_argument("--output", default="")
-    parser.add_argument("--output_s3", default="mil/vlm_results/c16_benchmark")
+    parser.add_argument("--output_s3", default="")
     parser.add_argument("--cache_dir", default="/tmp/vlm_patch_cache")
+    parser.add_argument(
+        "--dataset",
+        default=os.environ.get("BENCHMARK_DATASETS", "c16"),
+        choices=["c16", "c17"],
+        help="Dataset family to benchmark: c16 (c16_native + c17_to_c16) or "
+             "c17 (c17_native + c16_to_c17). May be overridden by BENCHMARK_DATASETS env.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
@@ -696,7 +705,7 @@ def main() -> int:
         choices=["single", "separate", "context"],
         help="Patch feeding mode: single = per-patch calls (default); "
              "separate = n_patches per slide, one call each, aggregated answer "
-             "(any A->A, all B->B, else C); context = n_patches per slide in "
+             "(majority vote, tie -> C); context = n_patches per slide in "
              "one multi-image call. May be overridden by BENCHMARK_MODE env.",
     )
     parser.add_argument(
@@ -719,12 +728,19 @@ def main() -> int:
         run_modes = [args.mode]
 
     registry_path = _resolve_registry(args.registry_csv)
+    dataset_key = args.dataset
+    if dataset_key not in DATASET_SETS:
+        print(f"[benchmark] WARNING: unknown dataset {dataset_key!r}, using c16")
+        dataset_key = "c16"
+    datasets = DATASET_SETS[dataset_key]
+    if not args.output_s3:
+        args.output_s3 = f"mil/vlm_results/{dataset_key}_benchmark"
     print(f"[benchmark] Loading registry: {registry_path}")
     registry = pd.read_csv(registry_path)
     print(f"  Total registry entries: {len(registry)}")
 
-    registry = registry[registry["dataset"].isin(C16_DATASETS)]
-    print(f"  After C16 dataset filter: {len(registry)}")
+    registry = registry[registry["dataset"].isin(datasets)]
+    print(f"  After {dataset_key} dataset filter ({'/'.join(datasets)}): {len(registry)}")
 
     non_random = registry[registry["selection_source"] != "random"].copy()
     random_part = registry[registry["selection_source"] == "random"].copy()
@@ -947,7 +963,7 @@ def main() -> int:
     if args.output:
         output_path = Path(args.output)
     else:
-        output_path = Path(tempfile.gettempdir()) / f"c16_vlm_benchmark{suffix}.json"
+        output_path = Path(tempfile.gettempdir()) / f"{dataset_key}_vlm_benchmark{suffix}.json"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
