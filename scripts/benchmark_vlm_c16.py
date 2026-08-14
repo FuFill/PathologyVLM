@@ -22,7 +22,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib
-import io
 import json
 import os
 import re
@@ -38,6 +37,7 @@ from typing import Optional
 import pandas as pd
 import torch
 from PIL import Image
+from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -185,15 +185,20 @@ def _download_patch(minio_path: str, cache_dir: Path) -> Optional[Path]:
     cached = cache_dir / internal_path.replace("/", "_")
     if cached.exists():
         return cached
-    client = get_s3_client()
-    s3_path = tar_key
+
+    # Cache the whole tar once per key; patches are then extracted from the
+    # on-disk tar instead of re-downloading the (large) archive per patch.
+    tar_name = tar_key.rstrip("/").split("/")[-1] or "patch.tar.gz"
+    tar_cache = cache_dir / tar_name
+    if not tar_cache.exists():
+        try:
+            _download_tar(tar_key, tar_cache)
+        except Exception as exc:
+            print(f"  [benchmark] WARNING: tar download failed for {tar_key}: {exc}")
+            return None
+
     try:
-        obj = client.get_object(
-            Bucket="pershin-medailab",
-            Key=s3_path,
-        )
-        body = obj["Body"].read()
-        with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as tf:
+        with tarfile.open(tar_cache, mode="r:gz") as tf:
             try:
                 member = tf.getmember(internal_path)
             except KeyError:
@@ -203,12 +208,44 @@ def _download_patch(minio_path: str, cache_dir: Path) -> Optional[Path]:
             if f is None:
                 return None
             img_data = f.read()
-            cached.parent.mkdir(parents=True, exist_ok=True)
-            cached.write_bytes(img_data)
-            return cached
     except Exception as exc:
-        print(f"  [benchmark] WARNING: download failed for {internal_path}: {exc}")
+        print(f"  [benchmark] WARNING: extract failed for {internal_path}: {exc}")
         return None
+
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(img_data)
+    return cached
+
+
+def _download_tar(tar_key: str, dst: Path) -> None:
+    import botocore
+
+    client = get_s3_client()
+    config = botocore.config.Config(connect_timeout=30, read_timeout=120)
+    try:
+        obj = client.get_object(Bucket="pershin-medailab", Key=tar_key, Config=config)
+    except TypeError:
+        obj = client.get_object(Bucket="pershin-medailab", Key=tar_key)
+    total = int(obj.get("ContentLength") or 0)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".part")
+    body = obj["Body"]
+    with tqdm(
+        total=total,
+        unit="B",
+        unit_scale=True,
+        desc=f"  download {dst.name}",
+        leave=False,
+        dynamic_ncols=True,
+    ) as pbar:
+        with open(tmp, "wb") as fh:
+            while True:
+                chunk = body.read(1024 * 1024)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                pbar.update(len(chunk))
+    tmp.rename(dst)
 
 
 def _load_image(path: Path) -> Optional[Image.Image]:
