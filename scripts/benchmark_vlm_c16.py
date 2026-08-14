@@ -218,14 +218,8 @@ def _download_patch(minio_path: str, cache_dir: Path) -> Optional[Path]:
 
 
 def _download_tar(tar_key: str, dst: Path) -> None:
-    import botocore
-
     client = get_s3_client()
-    config = botocore.config.Config(connect_timeout=30, read_timeout=120)
-    try:
-        obj = client.get_object(Bucket="pershin-medailab", Key=tar_key, Config=config)
-    except TypeError:
-        obj = client.get_object(Bucket="pershin-medailab", Key=tar_key)
+    obj = client.get_object(Bucket="pershin-medailab", Key=tar_key)
     total = int(obj.get("ContentLength") or 0)
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(dst.suffix + ".part")
