@@ -217,29 +217,50 @@ def _download_patch(minio_path: str, cache_dir: Path) -> Optional[Path]:
     return cached
 
 
+def _s3_with_retry(fn, retries: int = 6, base_wait: float = 10.0, label: str = "s3"):
+    """Run fn (an S3 call) with exponential backoff; MinIO throttles (SlowDownRead)."""
+    last = None
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as exc:
+            last = exc
+            wait = base_wait * (2 ** attempt)
+            print(f"  [benchmark] {label} attempt {attempt + 1} failed: {exc}; "
+                  f"retrying in {wait:.0f}s")
+            time.sleep(wait)
+    raise last
+
+
 def _download_tar(tar_key: str, dst: Path) -> None:
     client = get_s3_client()
-    obj = client.get_object(Bucket="pershin-medailab", Key=tar_key)
-    total = int(obj.get("ContentLength") or 0)
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(dst.suffix + ".part")
-    body = obj["Body"]
-    with tqdm(
-        total=total,
-        unit="B",
-        unit_scale=True,
-        desc=f"  download {dst.name}",
-        leave=False,
-        dynamic_ncols=True,
-    ) as pbar:
-        with open(tmp, "wb") as fh:
-            while True:
-                chunk = body.read(1024 * 1024)
-                if not chunk:
-                    break
-                fh.write(chunk)
-                pbar.update(len(chunk))
-    tmp.rename(dst)
+
+    def _run() -> None:
+        if tmp.exists():
+            tmp.unlink()
+        obj = client.get_object(Bucket="pershin-medailab", Key=tar_key)
+        total = int(obj.get("ContentLength") or 0)
+        body = obj["Body"]
+        with tqdm(
+            total=total,
+            unit="B",
+            unit_scale=True,
+            desc=f"  download {dst.name}",
+            leave=False,
+            dynamic_ncols=True,
+        ) as pbar:
+            with open(tmp, "wb") as fh:
+                while True:
+                    chunk = body.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    pbar.update(len(chunk))
+        tmp.rename(dst)
+
+    _s3_with_retry(_run, label=f"tar {tar_key.split('/')[-1]}")
 
 
 def _load_image(path: Path) -> Optional[Image.Image]:
@@ -639,7 +660,10 @@ def _resolve_registry(path: str) -> str:
             bucket, key = parts
             client = get_s3_client()
             tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
-            client.download_file(bucket, key, tmp.name)
+            _s3_with_retry(
+                lambda: client.download_file(bucket, key, tmp.name),
+                label="registry download",
+            )
             print(f"[benchmark] Downloaded registry from {path} to {tmp.name}")
             return tmp.name
     return path
