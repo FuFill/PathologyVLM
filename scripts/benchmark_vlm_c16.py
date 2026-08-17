@@ -713,7 +713,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Benchmark VLM models on C16 control patches"
     )
-    parser.add_argument("--registry_csv", default=REGISTRY_CSV_DEFAULT)
+    parser.add_argument(
+        "--registry_csv",
+        default=os.environ.get("BENCHMARK_REGISTRY", REGISTRY_CSV_DEFAULT),
+    )
     parser.add_argument(
         "--model",
         default=os.environ.get("BENCHMARK_MODELS", "quilt_llava"),
