@@ -399,6 +399,98 @@ def _parse_gemma(raw: str) -> tuple[str, list[str]]:
     return answer, cited
 
 
+DISAGREE_RE = re.compile(
+    r"\b(disagree|does not (match|support|align)|no evidence|not (consistent|supported)|"
+    r"incorrect|mistaken|wrong|unsupported)\b",
+    re.IGNORECASE,
+)
+
+VARIANT_KEYS = ("hint_resident", "adv_resident", "hint_tool", "adv_tool")
+
+
+def cmd_analyze3(args: argparse.Namespace) -> None:
+    with open(args.explain3_json, encoding="utf-8") as f:
+        data = json.load(f)
+    recs = [r for r in data["models"]["med_gemma"] if r["mode"] == "explain3"]
+    print(f"[analyze3] explain3 records: {len(recs)}")
+    rec_by_key = {_set_key(r): r for r in recs}
+
+    registry = pd.read_csv(args.registry)
+    registry = registry[registry["dataset"] == "c17_native"].copy()
+    if "random_seed" not in registry.columns:
+        registry["random_seed"] = 0
+    registry["random_seed"] = registry["random_seed"].fillna(0).astype(int)
+    hint_by_key = {}
+    for _, row in registry.iterrows():
+        k = (row["dataset"], row["slide_id"], row["selection_source"],
+             row["context_set"], int(row["random_seed"]))
+        hint_by_key[k] = (str(row["hint"]).strip(), str(row["hint_inverted"]).strip())
+    print(f"[analyze3] hints: {len(hint_by_key)} keys")
+
+    flip = {}
+    if args.ablate_json:
+        with open(args.ablate_json, encoding="utf-8") as f:
+            ablate = json.load(f)
+        ablate_recs = [r for r in ablate["models"]["med_siglip"] if r["mode"] == "ablate"]
+        table = _flip_table(ablate_recs)
+        flip = {k: t for k, t in table.items() if t["flipped"]}
+
+    rows = []
+    for key, r in rec_by_key.items():
+        hint, hint_inv = hint_by_key.get(key, ("", ""))
+        e3 = r.get("explain3") or {}
+        row = {
+            "patch_set_uid": str(r.get("patch_set_uid", "")),
+            "group": r.get("group", ""),
+            "slide_id": r.get("slide_id", ""),
+            "hint": hint,
+            "hint_inverted": hint_inv,
+            "base_answer": r.get("answer", ""),
+            "flipped": key in flip,
+        }
+        for vk in VARIANT_KEYS:
+            v = e3.get(vk) or {}
+            vans = v.get("answer", "")
+            vraw = v.get("raw", "")
+            row[f"{vk}_answer"] = vans
+            row[f"{vk}_agrees_base"] = bool(vans and vans == row["base_answer"])
+            row[f"{vk}_cited"] = ";".join(_parse_gemma(vraw)[1])
+            if vk.startswith("hint"):
+                row[f"{vk}_follows_hint"] = bool(vans and vans == hint)
+                row[f"{vk}_disagree"] = bool(DISAGREE_RE.search(vraw))
+            else:
+                row[f"{vk}_susceptible"] = bool(vans and vans == hint_inv)
+                row[f"{vk}_disagree"] = bool(DISAGREE_RE.search(vraw))
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    out.to_csv(args.out, index=False)
+    print(f"[analyze3] rows: {len(out)} -> {args.out}")
+
+    fl = out[out["flipped"]]
+    print("\n=== ALL sets ===")
+    for vk in ("hint_resident", "hint_tool", "adv_resident", "adv_tool"):
+        col = f"{vk}_answer"
+        dist = out[col].value_counts().to_dict()
+        print(f"  {vk}: dist={dist}")
+    print("hint-following (resident):", f"{out['hint_resident_follows_hint'].mean():.2%}")
+    print("hint-following (tool):", f"{out['hint_tool_follows_hint'].mean():.2%}")
+    print("susceptibility (resident):", f"{out['adv_resident_susceptible'].mean():.2%}")
+    print("susceptibility (tool):", f"{out['adv_tool_susceptible'].mean():.2%}")
+    print("disagreement mention (hint_resident):", f"{out['hint_resident_disagree'].mean():.2%}")
+    print("disagreement mention (adv_resident):", f"{out['adv_resident_disagree'].mean():.2%}")
+    print("\n=== Flipped sets (n=%d) ===" % len(fl))
+    if len(fl):
+        for vk in ("hint_resident", "hint_tool", "adv_resident", "adv_tool"):
+            col = f"{vk}_follows_hint" if vk.startswith("hint") else f"{vk}_susceptible"
+            print(f"  {vk}: {fl[col].mean():.2%}")
+    print("\n=== By group (all sets) ===")
+    for g, grp in out.groupby("group"):
+        print(f"  {g}: n={len(grp)} hint_follow_res={grp['hint_resident_follows_hint'].mean():.2%} "
+              f"hint_follow_tool={grp['hint_tool_follows_hint'].mean():.2%} "
+              f"susc_res={grp['adv_resident_susceptible'].mean():.2%} "
+              f"susc_tool={grp['adv_tool_susceptible'].mean():.2%}")
+
+
 def cmd_analyze(args: argparse.Namespace) -> None:
     with open(args.ablate_json, encoding="utf-8") as f:
         ablate = json.load(f)
@@ -510,6 +602,13 @@ def main() -> None:
                    help="context-run JSON with siglip answers (942a71d0)")
     p.add_argument("--out", required=True, help="output registry CSV with hint columns")
     p.set_defaults(func=cmd_hints)
+
+    p = sub.add_parser("analyze3", help="prompt-robustness analysis (explain3 run)")
+    p.add_argument("--explain3-json", required=True, help="explain3-run JSON (med_gemma)")
+    p.add_argument("--registry", required=True, help="registry CSV with hint columns")
+    p.add_argument("--ablate-json", default="", help="optional reconstructed ablate JSON")
+    p.add_argument("--out", required=True, help="output CSV")
+    p.set_defaults(func=cmd_analyze3)
 
     p = sub.add_parser("analyze", help="join gemma explain run with flip table")
     p.add_argument("--ablate-json", required=True, help="ablation-run JSON (siglip)")
