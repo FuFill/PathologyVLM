@@ -279,6 +279,39 @@ def _log_lines_answers(log: str, total: int, ablate: bool) -> dict[int, dict]:
     return out
 
 
+HINT_TEXT = {"A": "TUMOR PRESENT", "B": "NO TUMOR", "C": "INSUFFICIENT"}
+HINT_INVERT = {"A": "B", "B": "A", "C": "A"}
+
+
+def cmd_hints(args: argparse.Namespace) -> None:
+    with open(args.benchmark_json, encoding="utf-8") as f:
+        data = json.load(f)
+    recs = [r for r in data["models"]["med_siglip"]
+            if r["dataset"] == "c17_native" and r["mode"] == "context"]
+    answers = {_set_key(r): r["answer"] for r in recs}
+    print(f"[hints] context answers: {len(answers)}")
+
+    registry = pd.read_csv(args.registry)
+    registry = registry[registry["dataset"] == "c17_native"].copy()
+    if "random_seed" not in registry.columns:
+        registry["random_seed"] = 0
+    registry["random_seed"] = registry["random_seed"].fillna(0).astype(int)
+    keys = registry.apply(
+        lambda r: (r["dataset"], r["slide_id"], r["selection_source"],
+                   r["context_set"], int(r["random_seed"])),
+        axis=1,
+    )
+    hints = keys.map(answers)
+    missing = hints.isna().sum()
+    if missing:
+        raise SystemExit(f"[hints] ERROR: {missing} registry rows without a context answer")
+    registry["hint"] = hints
+    registry["hint_inverted"] = hints.map(HINT_INVERT)
+    registry.to_csv(args.out, index=False)
+    print(f"[hints] registry rows: {len(registry)} (hint + hint_inverted) -> {args.out}")
+    print(f"[hints] hint distribution: {dict(registry['hint'].value_counts())}")
+
+
 def cmd_parse_log(args: argparse.Namespace) -> None:
     log = open(args.log, encoding="utf-8", errors="replace").read()
     total_match = re.findall(r"\[(\d+)/(\d+)(?: ablate)?\]", log)
@@ -470,6 +503,13 @@ def main() -> None:
     p.add_argument("--n-control", type=int, default=25)
     p.add_argument("--seed", type=int, default=42)
     p.set_defaults(func=cmd_parse_log)
+
+    p = sub.add_parser("hints", help="attach siglip context answers as hint columns")
+    p.add_argument("--registry", required=True, help="filtered registry CSV (272-set)")
+    p.add_argument("--benchmark-json", required=True,
+                   help="context-run JSON with siglip answers (942a71d0)")
+    p.add_argument("--out", required=True, help="output registry CSV with hint columns")
+    p.set_defaults(func=cmd_hints)
 
     p = sub.add_parser("analyze", help="join gemma explain run with flip table")
     p.add_argument("--ablate-json", required=True, help="ablation-run JSON (siglip)")
