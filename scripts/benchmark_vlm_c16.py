@@ -715,6 +715,22 @@ def _run_model_sets(
             **({"ablation": ablation} if ablation else {}),
         })
 
+        if os.environ.get("BENCHMARK_PRINT_JSONL", "") == "1":
+            print("RESULT_JSONL " + json.dumps({
+                "mode": mode,
+                "patch_set_uid": set_id,
+                "slide_id": str(p0.get("slide_id", "")),
+                "dataset": str(p0.get("dataset", "")),
+                "context_set": str(p0.get("context_set", "")),
+                "group": group_key,
+                "selection_source": src,
+                "random_seed": int(seed_val) if pd.notna(seed_val) else 0,
+                "tile_in_mask": int(any(p["tile_in_mask"] == 1 for p in patch_info.values())),
+                "answer": answer,
+                "parse_valid": parse_valid,
+                "raw": raw_responses[0] if raw_responses else "",
+            }, ensure_ascii=False))
+
     elapsed = time.time() - t0
     print(f"\n  Done: {len(all_records)} sets, {elapsed:.0f}s")
     return all_records

@@ -146,8 +146,18 @@ def cmd_select(args: argparse.Namespace) -> None:
         print(f"[select] uploaded: {url}")
 
 
-def _flip_table(recs: list[dict]) -> dict[str, dict]:
-    table: dict[str, dict] = {}
+def _set_key(rec: dict) -> tuple:
+    return (
+        rec.get("dataset", ""),
+        rec.get("slide_id", ""),
+        rec.get("selection_source", ""),
+        rec.get("context_set", ""),
+        int(rec.get("random_seed") or 0),
+    )
+
+
+def _flip_table(recs: list[dict]) -> dict[tuple, dict]:
+    table: dict[tuple, dict] = {}
     for r in recs:
         ablation = r.get("ablation") or {}
         full = r.get("answer", "")
@@ -166,7 +176,7 @@ def _flip_table(recs: list[dict]) -> dict[str, dict]:
                 essential_p = "none"
         else:
             essential_p = ""
-        table[r["patch_set_uid"]] = {
+        table[_set_key(r)] = {
             "rec": r,
             "flipped": bool(flip_pairs),
             "flip_pairs": flip_pairs,
@@ -205,6 +215,146 @@ def cmd_flips(args: argparse.Namespace) -> None:
         print(f"[flips] uploaded: {url}")
 
 
+def _run_order(registry: pd.DataFrame) -> list[dict]:
+    """Reproduce the benchmark's set order: groupby(keys, sort=False) over the
+    registry (first-appearance order, duplicate keys merged), then top_k first."""
+    df = registry.copy()
+    if "random_seed" not in df.columns:
+        df["random_seed"] = 0
+    df["random_seed"] = df["random_seed"].fillna(0)
+    keys = ["dataset", "slide_id", "selection_source", "context_set", "random_seed"]
+    order: list[dict] = []
+    seen: set = set()
+    for _, grp in df.groupby(keys, sort=False):
+        k = tuple(grp[keys].iloc[0])
+        if k in seen:
+            continue
+        seen.add(k)
+        order.append({
+            "dataset": str(grp["dataset"].iloc[0]),
+            "slide_id": str(grp["slide_id"].iloc[0]),
+            "selection_source": str(grp["selection_source"].iloc[0]),
+            "context_set": str(grp["context_set"].iloc[0]),
+            "random_seed": int(grp["random_seed"].iloc[0]),
+        })
+    return [s for s in order if s["selection_source"] == "top_k"] + [
+        s for s in order if s["selection_source"] != "top_k"
+    ]
+
+
+def _group_str(rec: dict) -> str:
+    if rec["selection_source"] == "random":
+        return f"random_seed_{int(rec['random_seed'])}|{rec['context_set']}"
+    return f"{rec['selection_source']}|{rec['context_set']}"
+
+
+def _log_lines_answers(log: str, total: int, ablate: bool) -> dict[int, dict]:
+    """Parse 'RAW: <raw>  -> <ans>' lines for each set index (1-based)."""
+    out: dict[int, dict] = {}
+    lines = log.splitlines()
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        m = re.match(
+            rf"^\s+\[(\d+)/{total}( ablate (P1|P2|P3|P1P2|P1P3|P2P3))?\] RAW: (.*)$",
+            line,
+        )
+        if not m:
+            continue
+        idx, _, key, rest = m.groups()
+        idx = int(idx)
+        if (key and not ablate) or (not key and ablate):
+            continue
+        parts = rest.rsplit("  -> ", 1)
+        raw = parts[0]
+        ans = parts[1] if len(parts) == 2 and parts[1] in ("A", "B", "C") else ""
+        score = None
+        if i + 1 < len(lines):
+            sm = re.search(r"score=(-?[\d.]+)", lines[i + 1])
+            if sm:
+                score = float(sm.group(1))
+        out.setdefault(idx, {})[key or "full"] = {
+            "raw": raw, "answer": ans, "score": score,
+        }
+    return out
+
+
+def cmd_parse_log(args: argparse.Namespace) -> None:
+    log = open(args.log, encoding="utf-8", errors="replace").read()
+    total_match = re.findall(r"\[(\d+)/(\d+)(?: ablate)?\]", log)
+    totals = {int(b) for _, b in total_match}
+    if len(totals) != 1:
+        raise SystemExit(f"[parse-log] ambiguous set totals in log: {totals}")
+    total = max(totals)
+
+    order_df = pd.read_csv(args.order_registry)
+    order = _run_order(order_df)
+    if len(order) != total:
+        raise SystemExit(
+            f"[parse-log] order mismatch: {len(order)} sets in registry vs "
+            f"{total} in log")
+    print(f"[parse-log] sets: {total}")
+
+    answers = _log_lines_answers(log, total, ablate=False)
+    ablations = _log_lines_answers(log, total, ablate=True)
+    missing_full = set(range(1, total + 1)) - set(answers)
+    missing_abl = set(range(1, total + 1)) - set(ablations)
+    if missing_full or missing_abl:
+        raise SystemExit(
+            f"[parse-log] incomplete log: missing full {sorted(missing_full)[:5]}, "
+            f"missing ablations {sorted(missing_abl)[:5]}")
+
+    recs = []
+    for idx, base in enumerate(order, start=1):
+        full = answers[idx]["full"]
+        ablation = {}
+        for key, entry in sorted(ablations[idx].items()):
+            ablation[key] = {
+                "raw": entry["raw"],
+                "answer": entry["answer"],
+                "parse_valid": entry["answer"] in ("A", "B", "C"),
+                **({"score": entry["score"]} if entry["score"] is not None else {}),
+            }
+        recs.append({
+            "model": "med_siglip",
+            "mode": "ablate",
+            "patch_set_uid": f"log-{idx:03d}",
+            **base,
+            "group": _group_str(base),
+            "answer": full["answer"],
+            "parse_valid": full["answer"] in ("A", "B", "C"),
+            "raw_responses": [full["raw"]],
+            **({"score": full["score"]} if full["score"] is not None else {}),
+            "ablation": ablation,
+        })
+
+    data = {"models": {"med_siglip": recs}}
+    with open(args.out_json, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    print(f"[parse-log] reconstructed {len(recs)} records -> {args.out_json}")
+
+    table = _flip_table(recs)
+    flipped = [t for t in table.values() if t["flipped"]]
+    non_flipped = [t for t in table.values() if not t["flipped"]]
+    print(f"[parse-log] flipped: {len(flipped)}  non-flipped: {len(non_flipped)}")
+    essential_counts = Counter(t["essential"] for t in flipped)
+    print(f"[parse-log] essential patches: {dict(essential_counts)}")
+
+    rng = random.Random(args.seed)
+    control = rng.sample(
+        sorted(non_flipped, key=lambda t: t["rec"]["patch_set_uid"]),
+        min(args.n_control, len(non_flipped)),
+    )
+    print(f"[parse-log] control sets: {len(control)}")
+
+    registry = pd.read_csv(args.registry)
+    registry = registry[registry["dataset"] == "c17_native"]
+    sel = [t["rec"] for t in flipped] + [t["rec"] for t in control]
+    out_df = _registry_rows_for_sets(registry, sel)
+    out_df.to_csv(args.out_registry, index=False)
+    print(f"[parse-log] registry rows: {len(out_df)} ({len(sel)} sets) -> {args.out_registry}")
+
+
 FINAL_ANSWER_RE = re.compile(r"FINAL\s*ANSWER\s*:\s*([ABC])", re.IGNORECASE)
 CITED_RE = re.compile(r"\bP([123])\b")
 
@@ -226,11 +376,11 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         explain = json.load(f)
     explain_recs = [r for r in explain["models"]["med_gemma"] if r["mode"] == "explain"]
     print(f"[analyze] explain records: {len(explain_recs)}")
-    gemma = {r["patch_set_uid"]: r for r in explain_recs}
+    gemma = {_set_key(r): r for r in explain_recs}
 
     rows = []
-    for uid, t in table.items():
-        g = gemma.get(uid)
+    for key, t in table.items():
+        g = gemma.get(key)
         if g is None:
             continue
         raw = g["raw_responses"][0] if g.get("raw_responses") else ""
@@ -242,7 +392,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         else:
             cites_essential = cites_overlap = False
         rows.append({
-            "patch_set_uid": uid,
+            "patch_set_uid": str(t["rec"].get("patch_set_uid", "")),
             "group": t["rec"]["group"],
             "slide_id": t["rec"]["slide_id"],
             "siglip_answer": sig,
@@ -308,6 +458,18 @@ def main() -> None:
     p.add_argument("--n-control", type=int, default=25)
     p.add_argument("--seed", type=int, default=42)
     p.set_defaults(func=cmd_flips)
+
+    p = sub.add_parser("parse-log", help="reconstruct ablate run from ClearML task log")
+    p.add_argument("--log", required=True, help="task log file (text)")
+    p.add_argument("--order-registry", required=True,
+                   help="filtered registry CSV used in the run (set order)")
+    p.add_argument("--registry", required=True, help="full patch registry CSV")
+    p.add_argument("--out-json", required=True, help="reconstructed ablation JSON")
+    p.add_argument("--out-registry", required=True,
+                   help="output filtered registry CSV for gemma explain")
+    p.add_argument("--n-control", type=int, default=25)
+    p.add_argument("--seed", type=int, default=42)
+    p.set_defaults(func=cmd_parse_log)
 
     p = sub.add_parser("analyze", help="join gemma explain run with flip table")
     p.add_argument("--ablate-json", required=True, help="ablation-run JSON (siglip)")
