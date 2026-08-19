@@ -106,6 +106,36 @@ Then, after your reasoning, append the phrase "FINAL ANSWER:" followed by your c
 
 FINAL ANSWER:"""
 
+PROMPT_TEMPLATE_EXPLAIN = """You are a pathology AI analyzing H&E stained lymph node tissue patches.
+
+Below are three tissue patches (P1, P2, P3) from a lymph node biopsy.
+
+For each patch, decide:
+- A: Tumor features are clearly visible in this patch
+- B: Tumor features are NOT visible in this patch
+- C: The presented data is insufficient to decide
+
+First, analyze each patch independently and briefly explain your reasoning. Then give your overall assessment:
+- A if tumor is evident in at least one patch
+- B if no tumor features are seen in any patch and tissue is adequate
+- C if tissue is inadequate, ambiguous, or you cannot make a determination
+
+After your assessment, state explicitly which of the patches (P1, P2 or P3) your overall assessment is based on, naming every patch you used.
+
+Then, after your reasoning, append the phrase "FINAL ANSWER:" followed by your choice (A, B, or C) at the end of your response.
+
+FINAL ANSWER:"""
+
+ABLATION_SUBSETS = (("P1",), ("P2",), ("P3",), ("P1", "P2"), ("P1", "P3"), ("P2", "P3"))
+
+
+def _ablate_prompt(names: tuple[str, ...]) -> str:
+    listed = ", ".join(names)
+    return PROMPT_TEMPLATE_CONTEXT.replace(
+        "Below are three tissue patches (P1, P2, P3) from a lymph node biopsy.",
+        f"Below are tissue patches ({listed}) from a lymph node biopsy.",
+    )
+
 
 def _git_commit() -> str:
     try:
@@ -522,7 +552,12 @@ def _run_model_sets(
         patch_sets = patch_sets[:max_patches]
     print(f"  Patch sets: {len(patch_sets)}")
 
-    prompt = PROMPT_TEMPLATE_SEPARATE if mode == "separate" else PROMPT_TEMPLATE_CONTEXT
+    if mode == "separate":
+        prompt = PROMPT_TEMPLATE_SEPARATE
+    elif mode == "explain":
+        prompt = PROMPT_TEMPLATE_EXPLAIN
+    else:
+        prompt = PROMPT_TEMPLATE_CONTEXT
     print(f"  Prompt (mode={mode}): {prompt[:140].replace(chr(10), ' ')}...")
 
     all_records: list[dict] = []
@@ -619,6 +654,37 @@ def _run_model_sets(
             parse_valid = False
             print(f"    [{si+1}/{len(patch_sets)}] RAW: ERROR: {exc}")
 
+        ablation: dict[str, dict] = {}
+        if mode == "ablate":
+            for names in ABLATION_SUBSETS:
+                idxs = [int(n[1]) - 1 for n in names]
+                sub_imgs = [pil_images[i] for i in idxs if i < len(pil_images)]
+                key = "".join(names)
+                if len(sub_imgs) != len(names):
+                    ablation[key] = {
+                        "raw": "ERROR: missing patch", "answer": "", "parse_valid": False
+                    }
+                    continue
+                try:
+                    sub_raw = backend.generate(
+                        images=sub_imgs,
+                        prompt=_ablate_prompt(names),
+                        max_new_tokens=512,
+                        temperature=temperature,
+                        repetition_penalty=1.0,
+                        seed=seed,
+                    )
+                except Exception as exc:
+                    sub_raw = f"ERROR: {exc}"
+                sub_ans, sub_valid = _parse_answer(sub_raw)
+                ablation[key] = {
+                    "raw": sub_raw, "answer": sub_ans, "parse_valid": sub_valid,
+                }
+                print(
+                    f"    [{si+1}/{len(patch_sets)} ablate {key}] "
+                    f"RAW: {sub_raw.replace(chr(10), chr(92) + 'n')}  -> {sub_ans}"
+                )
+
         seed_val = p0.get("random_seed")
         src = str(p0.get("selection_source", "unknown"))
         ctx = str(p0.get("context_set", "")).strip().lower() or "unknown"
@@ -646,6 +712,7 @@ def _run_model_sets(
             "answer": answer,
             "parse_valid": parse_valid,
             **({"metrics": metrics} if metrics else {}),
+            **({"ablation": ablation} if ablation else {}),
         })
 
     elapsed = time.time() - t0
@@ -779,7 +846,7 @@ def main() -> int:
     mode = os.environ.get("BENCHMARK_MODE", args.mode)
     if mode == "both":
         run_modes = ["separate", "context"]
-    elif mode in ("single", "separate", "context"):
+    elif mode in ("single", "separate", "context", "ablate", "explain"):
         run_modes = [mode]
     else:
         print(f"[benchmark] WARNING: unknown BENCHMARK_MODE={mode!r}, falling back to {args.mode}")
@@ -1038,6 +1105,7 @@ def main() -> int:
                 "single": PROMPT_TEMPLATE_SINGLE,
                 "separate": PROMPT_TEMPLATE_SEPARATE,
                 "context": PROMPT_TEMPLATE_CONTEXT,
+                "explain": PROMPT_TEMPLATE_EXPLAIN,
             },
             "models": models_meta,
         },
@@ -1051,20 +1119,29 @@ def main() -> int:
     summary_df.to_csv(csv_path, index=False)
 
     urls = {}
-    for f in [output_path, csv_path]:
-        s3_key = f"{args.output_s3}/{f.name}"
-        url = upload_to_s3(str(f), s3_key)
-        urls[f.name] = url
-        print(f"  Uploaded: {url}")
+    no_s3_output = os.environ.get("BENCHMARK_NO_S3_OUTPUT", "") == "1"
+    if not no_s3_output:
+        for f in [output_path, csv_path]:
+            s3_key = f"{args.output_s3}/{f.name}"
+            url = upload_to_s3(str(f), s3_key)
+            urls[f.name] = url
+            print(f"  Uploaded: {url}")
+    else:
+        print(f"  BENCHMARK_NO_S3_OUTPUT=1: skipping S3 upload, "
+              f"attaching files to ClearML artifacts only")
 
     try:
         from clearml import Task
         clearml_task = Task.current_task()
         if clearml_task:
-            clearml_task.upload_artifact(name="benchmark_json", artifact_object=presign_url(urls[output_path.name]))
-            clearml_task.upload_artifact(name="benchmark_csv", artifact_object=presign_url(urls[csv_path.name]))
-            clearml_task.set_parameter("outputs/benchmark_json_uri", urls[output_path.name])
-            clearml_task.set_parameter("outputs/benchmark_csv_uri", urls[csv_path.name])
+            if urls:
+                clearml_task.upload_artifact(name="benchmark_json", artifact_object=presign_url(urls[output_path.name]))
+                clearml_task.upload_artifact(name="benchmark_csv", artifact_object=presign_url(urls[csv_path.name]))
+                clearml_task.set_parameter("outputs/benchmark_json_uri", urls[output_path.name])
+                clearml_task.set_parameter("outputs/benchmark_csv_uri", urls[csv_path.name])
+            else:
+                clearml_task.upload_artifact(name="benchmark_json", artifact_object=str(output_path))
+                clearml_task.upload_artifact(name="benchmark_csv", artifact_object=str(csv_path))
             print(f"  Uploaded to ClearML artifacts")
     except Exception as exc:
         print(f"  ClearML artifact upload skipped: {exc}")
