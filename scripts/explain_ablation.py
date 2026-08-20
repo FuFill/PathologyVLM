@@ -126,11 +126,11 @@ def cmd_select(args: argparse.Namespace) -> None:
     with open(args.benchmark_json, encoding="utf-8") as f:
         data = json.load(f)
     recs = [r for r in data["models"]["med_siglip"]
-            if r["dataset"] == "c17_native" and r["mode"] == "context"]
+            if r["dataset"] == args.dataset and r["mode"] == "context"]
     metadata = pd.read_csv(args.metadata)
     label_map = metadata.groupby("slide_id")["label"].first().to_dict()
     registry = pd.read_csv(args.registry)
-    registry = registry[registry["dataset"] == "c17_native"]
+    registry = registry[registry["dataset"] == args.dataset]
 
     pools = _pool_records(recs, label_map)
     selected: list[dict] = []
@@ -207,7 +207,7 @@ def cmd_flips(args: argparse.Namespace) -> None:
     print(f"[flips] control sets: {len(control)}")
 
     registry = pd.read_csv(args.registry)
-    registry = registry[registry["dataset"] == "c17_native"]
+    registry = registry[registry["dataset"] == args.dataset]
     sel = [t["rec"] for t in flipped] + [t["rec"] for t in control]
     out_df = _registry_rows_for_sets(registry, sel)
     out_df.to_csv(args.out, index=False)
@@ -289,12 +289,12 @@ def cmd_hints(args: argparse.Namespace) -> None:
     with open(args.benchmark_json, encoding="utf-8") as f:
         data = json.load(f)
     recs = [r for r in data["models"]["med_siglip"]
-            if r["dataset"] == "c17_native" and r["mode"] == "context"]
+            if r["dataset"] == args.dataset and r["mode"] == "context"]
     answers = {_set_key(r): r["answer"] for r in recs}
     print(f"[hints] context answers: {len(answers)}")
 
     registry = pd.read_csv(args.registry)
-    registry = registry[registry["dataset"] == "c17_native"].copy()
+    registry = registry[registry["dataset"] == args.dataset].copy()
     if "random_seed" not in registry.columns:
         registry["random_seed"] = 0
     registry["random_seed"] = registry["random_seed"].fillna(0).astype(int)
@@ -383,7 +383,7 @@ def cmd_parse_log(args: argparse.Namespace) -> None:
     print(f"[parse-log] control sets: {len(control)}")
 
     registry = pd.read_csv(args.registry)
-    registry = registry[registry["dataset"] == "c17_native"]
+    registry = registry[registry["dataset"] == args.dataset]
     sel = [t["rec"] for t in flipped] + [t["rec"] for t in control]
     out_df = _registry_rows_for_sets(registry, sel)
     out_df.to_csv(args.out_registry, index=False)
@@ -439,7 +439,7 @@ def cmd_analyze3(args: argparse.Namespace) -> None:
     rec_by_key = {_set_key(r): r for r in recs}
 
     registry = pd.read_csv(args.registry)
-    registry = registry[registry["dataset"] == "c17_native"].copy()
+    registry = registry[registry["dataset"] == args.dataset].copy()
     if "random_seed" not in registry.columns:
         registry["random_seed"] = 0
     registry["random_seed"] = registry["random_seed"].fillna(0).astype(int)
@@ -647,6 +647,7 @@ def main() -> None:
     p.add_argument("--metadata", required=True, help="MIL metadata CSV with slide labels")
     p.add_argument("--out", required=True, help="output filtered registry CSV")
     p.add_argument("--upload-s3", default="")
+    p.add_argument("--dataset", default="c17_native")
     p.add_argument("--per-group", type=int, default=40)
     p.add_argument("--seed", type=int, default=42)
     p.set_defaults(func=cmd_select)
@@ -656,6 +657,7 @@ def main() -> None:
     p.add_argument("--registry", required=True, help="full patch registry CSV")
     p.add_argument("--out", required=True, help="output filtered registry CSV")
     p.add_argument("--upload-s3", default="")
+    p.add_argument("--dataset", default="c17_native")
     p.add_argument("--n-control", type=int, default=25)
     p.add_argument("--seed", type=int, default=42)
     p.set_defaults(func=cmd_flips)
@@ -670,6 +672,7 @@ def main() -> None:
                    help="output filtered registry CSV for gemma explain")
     p.add_argument("--n-control", type=int, default=25)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--dataset", default="c17_native")
     p.set_defaults(func=cmd_parse_log)
 
     p = sub.add_parser("hints", help="attach siglip context answers as hint columns")
@@ -677,6 +680,7 @@ def main() -> None:
     p.add_argument("--benchmark-json", required=True,
                    help="context-run JSON with siglip answers (942a71d0)")
     p.add_argument("--out", required=True, help="output registry CSV with hint columns")
+    p.add_argument("--dataset", default="c17_native")
     p.set_defaults(func=cmd_hints)
 
     p = sub.add_parser("analyze3", help="prompt-robustness analysis (explain3 run)")
@@ -684,6 +688,7 @@ def main() -> None:
     p.add_argument("--registry", required=True, help="registry CSV with hint columns")
     p.add_argument("--ablate-json", default="", help="optional reconstructed ablate JSON")
     p.add_argument("--out", required=True, help="output CSV")
+    p.add_argument("--dataset", default="c17_native")
     p.set_defaults(func=cmd_analyze3)
 
     p = sub.add_parser("analyze", help="join gemma explain run with flip table")
