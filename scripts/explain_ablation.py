@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from scipy.stats import chi2, fisher_exact
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.s3_utils import upload_to_s3
 
@@ -408,6 +410,27 @@ DISAGREE_RE = re.compile(
 VARIANT_KEYS = ("hint_resident", "adv_resident", "hint_tool", "adv_tool")
 
 
+def _binom(n: int, k: int) -> float:
+    from math import comb
+    return comb(n, k)
+
+
+def _chi2_or_fisher(x: pd.Series, y: pd.Series) -> float:
+    a = int(x.sum())
+    b = int(len(x) - a)
+    c = int(y.sum())
+    d = int(len(y) - c)
+    if min(a, b, c, d) < 5:
+        return fisher_exact([[a, b], [c, d]])[1]
+    n = a + b + c + d
+    e = [[(a + b) * (a + c) / n, (a + b) * (b + d) / n],
+         [(c + d) * (a + c) / n, (c + d) * (b + d) / n]]
+    obs = [[a, b], [c, d]]
+    stat = sum((obs[i][j] - e[i][j]) ** 2 / e[i][j]
+               for i in range(2) for j in range(2))
+    return chi2.sf(stat, 1)
+
+
 def cmd_analyze3(args: argparse.Namespace) -> None:
     with open(args.explain3_json, encoding="utf-8") as f:
         data = json.load(f)
@@ -450,8 +473,11 @@ def cmd_analyze3(args: argparse.Namespace) -> None:
         }
         for vk in VARIANT_KEYS:
             v = e3.get(vk) or {}
-            vans = v.get("answer", "")
             vraw = v.get("raw", "")
+            if v.get("parse_valid") and str(v.get("answer", "")).strip() in {"A", "B", "C"}:
+                vans = str(v["answer"]).strip()
+            else:
+                vans = _parse_gemma(vraw)[0]
             row[f"{vk}_answer"] = vans
             row[f"{vk}_agrees_base"] = bool(vans and vans == row["base_answer"])
             row[f"{vk}_cited"] = ";".join(_parse_gemma(vraw)[1])
@@ -467,6 +493,7 @@ def cmd_analyze3(args: argparse.Namespace) -> None:
     print(f"[analyze3] rows: {len(out)} -> {args.out}")
 
     fl = out[out["flipped"]]
+    nf = out[~out["flipped"]]
     print("\n=== ALL sets ===")
     for vk in ("hint_resident", "hint_tool", "adv_resident", "adv_tool"):
         col = f"{vk}_answer"
@@ -478,17 +505,66 @@ def cmd_analyze3(args: argparse.Namespace) -> None:
     print("susceptibility (tool):", f"{out['adv_tool_susceptible'].mean():.2%}")
     print("disagreement mention (hint_resident):", f"{out['hint_resident_disagree'].mean():.2%}")
     print("disagreement mention (adv_resident):", f"{out['adv_resident_disagree'].mean():.2%}")
+
+    print("\n=== McNemar (base vs adv variant, binary A/non-A) ===")
+    for vk in ("adv_resident", "adv_tool"):
+        b = out["base_answer"]
+        a = out[f"{vk}_answer"]
+        valid = b.isin({"A", "B", "C"}) & a.isin({"A", "B", "C"})
+        bb, aa = b[valid], a[valid]
+        n10 = int(((bb == "A") & (aa != "A")).sum())
+        n01 = int(((bb != "A") & (aa == "A")).sum())
+        if (n10 + n01) <= 25:
+            pval = 2 * sum(0.5 ** (n10 + n01) * _binom(n10 + n01, k)
+                           for k in range(0, min(n10, n01) + 1))
+        else:
+            stat = ((abs(n10 - n01) - 1) ** 2) / max(n10 + n01, 1)
+            pval = chi2.sf(stat, 1)
+        print(f"  {vk}: n10(A->non-A)={n10} n01(non-A->A)={n01} "
+              f"converted={n10 + n01}/{len(bb)} McNemar p={pval:.4g}")
+
+    print("\n=== Susceptibility: flipped vs non-flipped ===")
+    for vk in ("adv_resident", "adv_tool"):
+        col = f"{vk}_susceptible"
+        p = _chi2_or_fisher(fl[col], nf[col])
+        print(f"  {vk}: flipped {fl[col].mean():.2%} (n={len(fl)}) vs "
+              f"non-flipped {nf[col].mean():.2%} (n={len(nf)}) p={p:.4g}")
+
+    print("\n=== Susceptibility: base==hint vs base!=hint ===")
+    for vk in ("adv_resident", "adv_tool"):
+        col = f"{vk}_susceptible"
+        agree = out[out["base_answer"] == out["hint"]]
+        differ = out[out["base_answer"] != out["hint"]]
+        p = _chi2_or_fisher(agree[col], differ[col])
+        print(f"  {vk}: agree {agree[col].mean():.2%} (n={len(agree)}) vs "
+              f"differ {differ[col].mean():.2%} (n={len(differ)}) p={p:.4g}")
+
+    print("\n=== Directional susceptibility by group (adv_resident / adv_tool) ===")
+    for g, grp in out.groupby("group"):
+        print(f"  {g}: n={len(grp)} susc_res={grp['adv_resident_susceptible'].mean():.2%} "
+              f"susc_tool={grp['adv_tool_susceptible'].mean():.2%}")
+
+    print("\n=== A->non-A transitions under adv hint ===")
+    for vk in ("adv_resident", "adv_tool"):
+        tr = out[(out["base_answer"] == "A") & (out[f"{vk}_answer"] != "A")]
+        print(f"  {vk}: {len(tr)} A->{''.join(tr[f'{vk}_answer'].unique())} "
+              f"| by group: {dict(tr.group.value_counts())}")
+
+    print("\n=== Verbatim adoption vs true conversion (adv) ===")
+    for vk in ("adv_resident", "adv_tool"):
+        sus = out[out[f"{vk}_susceptible"]]
+        conv = out[out[f"{vk}_answer"] != out["base_answer"]]
+        stay = out[(out[f"{vk}_susceptible"]) & (out[f"{vk}_answer"] == out["base_answer"])]
+        print(f"  {vk}: susceptible={len(sus)} | converted={len(conv)} "
+              f"| susceptible-but-base-unchanged={len(stay)}")
+        if len(conv):
+            print(f"      conversion by group: {dict(conv.group.value_counts())}")
+
     print("\n=== Flipped sets (n=%d) ===" % len(fl))
     if len(fl):
         for vk in ("hint_resident", "hint_tool", "adv_resident", "adv_tool"):
             col = f"{vk}_follows_hint" if vk.startswith("hint") else f"{vk}_susceptible"
             print(f"  {vk}: {fl[col].mean():.2%}")
-    print("\n=== By group (all sets) ===")
-    for g, grp in out.groupby("group"):
-        print(f"  {g}: n={len(grp)} hint_follow_res={grp['hint_resident_follows_hint'].mean():.2%} "
-              f"hint_follow_tool={grp['hint_tool_follows_hint'].mean():.2%} "
-              f"susc_res={grp['adv_resident_susceptible'].mean():.2%} "
-              f"susc_tool={grp['adv_tool_susceptible'].mean():.2%}")
 
 
 def cmd_analyze(args: argparse.Namespace) -> None:
